@@ -16,6 +16,7 @@ public:
     struct ScriptState {
         __int64 change_timestamp = 0;
         bool is_finish_state = true;
+        StatescriptState* state = nullptr; //The game's runtime state object; only valid while running
 
         ScriptState() noexcept {} //default
     };
@@ -137,6 +138,7 @@ private:
         auto& state = s_scriptStates[ss][ss->graph->STUFromState(istate)->ss_base.idx_in_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = false;
+        state.state = istate;
         StateEntry_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeStateFinished(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate) {
@@ -148,6 +150,7 @@ private:
         auto& state = s_scriptStates[ss][ss->graph->STUFromState(istate)->ss_base.idx_in_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = true;
+        state.state = nullptr;
         StateFinish_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeActionEntry(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate, int idx_in_m_nodes) {
@@ -155,6 +158,7 @@ private:
         auto& state = s_scriptStates[ss][idx_in_m_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = true;
+        state.state = nullptr;
         ActionEntry_orig(inner, ss, istate, idx_in_m_nodes);
     }
     static char __fastcall OnScriptEntry(__int64 a1, StatescriptInstance* ss, STUStatescriptBase* stu) {
@@ -162,6 +166,7 @@ private:
         auto& state = s_scriptStates[ss][stu->idx_in_nodes];
         state.change_timestamp = ss->ss_inner->cf_timestamp;
         state.is_finish_state = true;
+        state.state = nullptr;
         return ScriptEntry_orig(a1, ss, stu);
     }
     static StatescriptInstance* __fastcall Deallocate(StatescriptInstance* script, char a2) {

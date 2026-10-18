@@ -678,11 +678,10 @@ void PrometheusSystem::state_replicator_exhandled() {
 //Some states wait for something only the server provides and never finish client-side, leaving their
 //owner's ability/movement locks active (see docs/NOTES.md, Tracer's Recall). Finish them ourselves once
 //they ran longer than they normally would.
-//  0xCD396790 (name unknown): Recall's wind-up <4> (configured with 0.1 s); without this the rewind never starts.
 //  0x7211CF70 STUStatescriptStateHistoryRewinder: Recall's rewind <1>. Normally ended by
 //             emulate_history_rewind once the hero is back; this is only the fallback.
+//Timed waits without an end condition (e.g. Recall's wind-up 0xCD396790) are handled by their class, see below.
 static const std::map<uint, double> s_server_wait_timeouts = {
-	{ 0xCD396790, 0.1 },
 	{ 0x7211CF70, 2.0 },
 };
 static std::map<std::pair<StatescriptInstance*, int>, double> s_server_wait_started{};
@@ -693,6 +692,55 @@ static uint state_node_type(StatescriptInstance* inst, int idx) {
 	return inst->graph->m_nodes.list()[idx]->graph_node.base.vfptr->GetSTUInfo()->Hash;
 }
 
+//Timed wait states (node type 0xCD396790, class vtable 0x15D4840; Recall's wind-up and many other abilities):
+//  vfunc 34 (0xD67920) starts timer 1 with the duration in config var STU + 0x100,
+//  vfunc 40 (0xD67BF0) on timer 1 ends the state (0xF4A9C0) only if the condition in config var STU + 0x108 is true.
+//Most nodes leave that condition empty, which evaluates to false: the client never ends the wait itself, the server
+//did. Offline nothing does, so the state and the locks of the ability that owns it stay active forever.
+//Emulate the server: when timer 1 fires on a wait without a condition, end it. (The authority check in 0xF4A9C0
+//is not the problem: traced offline, it allowed every end request.)
+static constexpr __int64 RVA_TIMED_WAIT_ON_TIMER = 0xD67BF0;
+static constexpr __int64 RVA_END_STATE = 0xF4A9C0;
+static constexpr __int64 RVA_EVAL_CONFIG_FLOAT = 0xCFFF50;
+static constexpr double TIMED_WAIT_FALLBACK_GRACE_SECS = 0.25; //Past its duration, in case the timer never fires
+
+using TimedWaitOnTimerFn = void(__fastcall*)(StatescriptState* state, int timer_id);
+static TimedWaitOnTimerFn s_timed_wait_on_timer_orig = nullptr;
+
+//The STU node of a running state, looked up like the game's state vfuncs do.
+static __int64 state_stu_node(StatescriptState* state) {
+	auto table = *(__int64*)((char*)state->ss_instance + 0x160);
+	if (!table)
+		return 0;
+	auto lists = *(__int64**)(table + 0x60);
+	auto list = *(__int64*)(table + 0x68) == 1 ? lists[0] : lists[1];
+	return ((__int64*)list)[state->idx_in_m_states];
+}
+
+static bool is_timed_wait(StatescriptState* state) {
+	return ((__int64*)state->vfptr)[40] == globals::gameBase + RVA_TIMED_WAIT_ON_TIMER;
+}
+
+static void __fastcall timed_wait_on_timer_hook(StatescriptState* state, int timer_id) {
+	s_timed_wait_on_timer_orig(state, timer_id);
+	if (timer_id != 1)
+		return;
+	auto node = state_stu_node(state);
+	if (node && *(__int64*)(node + 0x108) == 0) {
+		LOG_CORE(Info, "[TRACE] timed wait over: script {:X} inst {} state {}\n",
+			state->ss_instance->script_id, state->ss_instance->instance_id, state->idx_in_m_states);
+		((void(__fastcall*)(StatescriptState*, unsigned short, __int64))(globals::gameBase + RVA_END_STATE))(state, 1, 0);
+	}
+}
+
+static double timed_wait_duration(StatescriptState* state) {
+	auto node = state_stu_node(state);
+	if (!node || !*(__int64*)(node + 0x100))
+		return 0;
+	return ((float(__fastcall*)(StatescriptInstance*, __int64, int))(globals::gameBase + RVA_EVAL_CONFIG_FLOAT))(
+		state->ss_instance, *(__int64*)(node + 0x100), 0);
+}
+
 static void finish_server_wait_states(Component_23_Statescript* ss) {
 	double now = GetGameRuntimeSecs();
 	std::set<std::pair<StatescriptInstance*, int>> running{};
@@ -701,13 +749,23 @@ static void finish_server_wait_states(Component_23_Statescript* ss) {
 		for (auto& [idx, state] : statescript_logger::GetScriptState(inst)) {
 			if (state.is_finish_state)
 				continue;
-			auto timeout = s_server_wait_timeouts.find(state_node_type(inst, idx));
-			if (timeout == s_server_wait_timeouts.end())
-				continue;
+			double timeout_secs;
+			if (state.state && is_timed_wait(state.state)) {
+				auto node = state_stu_node(state.state);
+				if (!node || *(__int64*)(node + 0x108) != 0)
+					continue; //Has its own end condition
+				timeout_secs = timed_wait_duration(state.state) + TIMED_WAIT_FALLBACK_GRACE_SECS;
+			}
+			else {
+				auto timeout = s_server_wait_timeouts.find(state_node_type(inst, idx));
+				if (timeout == s_server_wait_timeouts.end())
+					continue;
+				timeout_secs = timeout->second;
+			}
 			auto key = std::make_pair(inst, idx);
 			running.insert(key);
 			double& started = s_server_wait_started.try_emplace(key, now).first->second;
-			if (now - started > timeout->second) {
+			if (now - started > timeout_secs) {
 				to_finish.push_back(key);
 				started = now; //Retry later instead of every frame if finishing does not take
 			}
@@ -946,6 +1004,13 @@ void PrometheusSystem::OnTick(float tick) {
 				emulate_history_rewind(local_model, ss);
 			}
 		}
+	}
+
+	static bool s_applied_timed_wait_hook = false;
+	if (!s_applied_timed_wait_hook) {
+		s_applied_timed_wait_hook = true;
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER), (LPVOID)timed_wait_on_timer_hook, (PVOID*)&s_timed_wait_on_timer_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER)));
 	}
 
 	if (!_applied_quick_play) {

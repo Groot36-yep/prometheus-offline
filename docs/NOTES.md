@@ -87,10 +87,25 @@ instance, so only ~2k of 22k config vars get a value (dynamic/expression ones an
   `B4FE98D8` bool) is `<4>`. It appears 28 times across hero ability graphs (`0x20, 0x48, 0x7D, 0xE2, 0xF3,
   0xFE, 0x101, 0x169, 0x17B, 0x17E, 0x1F0, 0x232, 0x26A, 0x304, 0x9BB`). Output plugs seen: `3F6FFA05`
   (subgraphs), `D2CD7C9F` (Recall uses it to start `<1>`, so probably on-end), `FE841C79`, `025C665A`.
-  Working theory: it waits for a server confirmation, so client-only it never ends. Blink (`0x24`) does not
-  use it, which matches Blink working. Fixing it generically may fix other heroes' abilities too (item 6).
-- **Workaround in `PrometheusSystem::OnTick`** (`finish_server_wait_states`): on the local hero, states of
-  type `CD396790` are finished after 0.3 s and `HistoryRewinder` (`7211CF70`) after 1.5 s. Trace of a
+  Blink (`0x24`) does not use it, which matches Blink working.
+- **`CD396790` is a timed wait whose end is server-decided** (native analysis, 2026-10-18). Its runtime class
+  (vtable RVA `0x15D4840`, constructor `0xD62890`) overrides vfunc 34 `0xD67920` (on start: evaluate
+  `STU+0x100` as seconds, write start/duration/rate to the dynamic out vars at `+0x110/+0x118/+0x120`, start
+  timer 1 via `0xF47A50`) and vfunc 40 `0xD67BF0` (on timer 1: end the state via `0xF4A9C0` only if the
+  condition `STU+0x108` evaluates true). The condition evaluator `0xD16BF0` returns its default (false) for an
+  empty config var, and Recall's `<4>` (like most uses) leaves `B4FE98D8` empty, so the client never ends the
+  wait; the server did. Not the cause: the authority check inside `0xF4A9C0` (instance vfunc `+0x170`, check
+  fn `0xD73E90`) — traced offline, it allowed every end request.
+  A second class registered under the same hash (vtable `0x15D86C8`, factory `0x1085740`) only overrides vfunc
+  40 = `0xF531E0` ("on timer 1, end"); it was not seen running. Vfunc 40 is the per-state timer callback
+  (timer id as argument); vfuncs 34/35/36 are start/resume/update for the client-side wait (`0x16052B0`).
+- **Fix: `timed_wait_on_timer_hook`** hooks `0xD67BF0`: after the original runs on timer 1, a wait with an empty
+  condition is ended (`0xF4A9C0(state, 1, 0)`), as the server would. Covers every ability that uses the node,
+  not just Recall. `finish_server_wait_states` keeps a fallback (configured duration + 0.25 s) in case the
+  timer never fires. Verified in game: Recall's `<4>` ends ~0.09 s after it starts, the rewind plays, other
+  abilities and fire keep working; the fallback never triggered.
+- **Former workaround** (replaced by the fix above): states of type `CD396790` were finished after 0.3 s and
+  `HistoryRewinder` (`7211CF70`) after 1.5 s (the latter fallback is still there). Trace of a
   Recall with it: `<4>` start → forced end at +0.31 s → `<1>` HistoryRewinder starts with `<2>` Invisible,
   `<3>` PhaseOut, `<6>` MovementMod and Stack locks `<10>`/`<18>`/`<26>`; `<5>` HistoryBuilder pauses;
   `<9>` anim ends at +0.9 s; `<20>` SendGameMessage at +1.05 s; `<1>` never ends by itself → forced end
