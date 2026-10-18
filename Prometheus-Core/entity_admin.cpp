@@ -15,6 +15,8 @@
 #include "TimeScale.h"
 #include "Logs/Logs.h"
 #include "Components/Component_54_LobbyMap.h"
+#include "statescript_logger.h"
+#include <set>
 
 __int64 PrometheusSystem::get_inheritance() {
 	return NULL;
@@ -668,6 +670,51 @@ void PrometheusSystem::state_replicator_exhandled() {
 }
 
 
+static uint state_node_type(StatescriptInstance* inst, int idx) {
+	if (!inst->graph || idx < 0 || idx >= inst->graph->m_nodes.count())
+		return 0;
+	return inst->graph->m_nodes.list()[idx]->graph_node.base.vfptr->GetSTUInfo()->Hash;
+}
+
+//Debug trace for offline analysis: logs every state start/stop in the local hero's scripts.
+static std::map<std::pair<StatescriptInstance*, int>, bool> s_traced_states{};
+
+static void trace_state_changes(Component_23_Statescript* ss) {
+	static double budget_window = 0;
+	static int budget = 0;
+	double now = GetGameRuntimeSecs();
+	if (now - budget_window > 1.0) {
+		budget_window = now;
+		budget = 200; //Lines per second, so a flickering state can't flood the log
+	}
+	for (auto inst : ss->ss_inner) {
+		for (auto& [idx, state] : statescript_logger::GetScriptState(inst)) {
+			bool running = !state.is_finish_state;
+			auto [it, inserted] = s_traced_states.try_emplace(std::make_pair(inst, idx), !running);
+			if (it->second == running)
+				continue;
+			it->second = running;
+			if (budget-- > 0) {
+				LOG_CORE(Info, "[TRACE] state {}: script {:X} inst {} node <{}> type {:08X}\n",
+					running ? "start" : "end", inst->script_id, inst->instance_id, idx, state_node_type(inst, idx));
+			}
+		}
+	}
+}
+
+//Debug trace: logs logical button presses with their in-game names.
+static void trace_logical_buttons(Component_50_Input* input) {
+	static char previous[0xC3]{};
+	char* current = input->tick10 ? input->stru1.tick0 : input->stru1.tick1;
+	for (int i = 0; i < 0xC3; i++) {
+		if (current[i] != previous[i]) {
+			auto name = LogicalButtonById(i);
+			LOG_CORE(Info, "[TRACE] button {}: {} ({})\n", current[i] ? "down" : "up", i, name && name->name ? name->name : "?");
+		}
+	}
+	memcpy(previous, current, sizeof(previous));
+}
+
 void PrometheusSystem::OnTick(float tick) {
 	Entity* local_controller = _game_ea->getLocalEnt();
 	Entity* local_model = nullptr;
@@ -697,6 +744,8 @@ void PrometheusSystem::OnTick(float tick) {
 				alive.type = StatescriptPrimitive_BYTE;
 				alive.value = 1;
 				ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0xd8000000000094c }, alive);
+
+				trace_state_changes(ss);
 			}
 		}
 	}
@@ -969,6 +1018,9 @@ void PrometheusSystem::OnTick(float tick) {
 	}
 	if (!_input_component) {
 		_input_component = LobbyEntityAdmin()->getSingletonComponent<Component_50_Input>(0x50);
+	}
+	if (_input_component) {
+		trace_logical_buttons(_input_component);
 	}
 	else {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
