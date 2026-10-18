@@ -1,4 +1,5 @@
 #include "auto_test.h"
+#include "heroes.h"
 #include "game.h"
 #include "Statescript.h"
 #include "STU_Editable.h"
@@ -44,21 +45,7 @@ namespace auto_test {
 		{ "quick_weapon", false }, { "fire", true }, //Melee
 	};
 
-	struct Hero {
-		__int64 id;
-		const char* name;
-	};
-
-	//The heroes the build loads (see the data pack list in dllmain.cpp).
-	static constexpr Hero HEROES[] = {
-		{ 0x02e0000000000003, "Tracer" }, { 0x02e0000000000002, "Reaper" }, { 0x02e0000000000004, "Mercy" },
-		{ 0x02e0000000000005, "Hanzo" }, { 0x02e0000000000006, "Torbjorn" }, { 0x02e0000000000007, "Reinhardt" },
-		{ 0x02e0000000000008, "Pharah" }, { 0x02e0000000000009, "Winston" }, { 0x02e000000000000a, "Widowmaker" },
-		{ 0x02e0000000000015, "Bastion" }, { 0x02e0000000000016, "Symmetra" }, { 0x02e0000000000020, "Zenyatta" },
-		{ 0x02e0000000000029, "Genji" }, { 0x02e0000000000040, "Roadhog" }, { 0x02e0000000000042, "McCree" },
-		{ 0x02e0000000000065, "Junkrat" }, { 0x02e0000000000068, "Zarya" }, { 0x02e000000000006e, "Soldier76" },
-		{ 0x02e0000000000079, "Lucio" }, { 0x02e000000000007a, "DVa" }, { 0x02e00000000000dd, "Mei" },
-	};
+	using Hero = HeroInfo;
 
 	static constexpr int WORLD_STATE_RUNNING = 8;
 	static constexpr double MENU_SETTLE_SECS = 8.0;
@@ -71,7 +58,6 @@ namespace auto_test {
 	static constexpr double HERO_DATA_TIMEOUT_SECS = 60.0;
 	static constexpr double SPAWN_RETRY_SECS = 2.0;
 	static constexpr int SPAWN_ATTEMPTS = 5;
-	static constexpr __int64 RVA_LOAD_LOBBY_DATA_PACKS = 0xc7f090; //Top bar "DP Load": loads the hero data
 	static constexpr double GAP_SECS = 0.75;
 	static constexpr double PRESS_SECS = 0.2;
 	static constexpr double REACTION_SECS = 1.0; //From the press, how long a state change still counts as a reaction
@@ -382,6 +368,42 @@ namespace auto_test {
 		LOG_CORE(Info, "[AUTOTEST] wrote entities_dump.json ({} entities)\n", out.size());
 	}
 
+	//Debug: with PROMETHEUS_DUMP_MAP_ENTITIES set, every entity of the loaded map goes to Prometheus/map_entities.json
+	//(components with their data type, position), e.g. to find the spawn rooms.
+	static void dump_map_entities() {
+		auto env = getenv("PROMETHEUS_DUMP_MAP_ENTITIES");
+		if (!env || !*env)
+			return;
+		nlohmann::json out = nlohmann::json::array();
+		for (auto ent : *GameEntityAdmin()) {
+			nlohmann::json e = { { "id", std::format("{:X}", ent->entity_id) } };
+			if (!IsBadReadPtr(ent->resload_entry, sizeof(MisalignedResourceLoadEntry)))
+				e["resource"] = std::format("{:X}", ent->resload_entry->resource_id);
+			if (auto sr = ent->getById<Component_1_SceneRendering>(1)) {
+				e["pos"] = { sr->position.X, sr->position.Y, sr->position.Z };
+				e["rot"] = { sr->rotation.X, sr->rotation.Y, sr->rotation.Z, sr->rotation.W };
+			}
+			auto& comps = e["components"] = nlohmann::json::object();
+			for (int i = 0; i < ent->component_list.num - 1; i++) {
+				auto compo = ent->component_list.ptr[i];
+				if (!compo)
+					continue;
+				auto mirror = (STUBase<>*)compo->GetMirrorData();
+				std::string type = mirror ? hash_name(mirror->vfptr->GetSTUInfo()->Hash) : "";
+				auto key = std::format("{:X}", compo->component_id);
+				if (mirror && compo->component_id == 0x2E) //Spawn point
+					comps[key] = stu_json(mirror->to_editable(), 3);
+				else if (type.find("Spawn") != std::string::npos)
+					comps[key] = stu_json(mirror->to_editable(), 2);
+				else
+					comps[key] = type;
+			}
+			out.push_back(e);
+		}
+		std::ofstream("./Prometheus/map_entities.json", std::ios::trunc) << out.dump(1);
+		LOG_CORE(Info, "[AUTOTEST] wrote map_entities.json ({} entities)\n", out.size());
+	}
+
 	static void dump_requested_stus() {
 		dump_entities();
 		auto env = getenv("PROMETHEUS_DUMP_STU");
@@ -409,9 +431,7 @@ namespace auto_test {
 	}
 
 	static void load_data() {
-		globals::isDemo = true;
-		char buf[0x80]{};
-		((__int64(__fastcall*)(__int64, __int64, char*))(globals::gameBase + RVA_LOAD_LOBBY_DATA_PACKS))(0, 0, buf);
+		quick_play::load_hero_data();
 		LOG_CORE(Info, "[AUTOTEST] demo mode on, loading lobby data packs\n");
 		s_hero_data_seen = -1;
 		set_step(Step::LoadData);
@@ -488,7 +508,10 @@ namespace auto_test {
 			if (name.find(wanted) != std::string::npos)
 				return header.get_argument_resource("m_map")->resource_id;
 		}
-		LOG_CORE(Warn, "[AUTOTEST] no map matching '{}'\n", wanted);
+		std::string names{};
+		for (auto& [id, stu] : stu_resources::GetIfAssignableTo(stringHash("STUMapHeader")))
+			names += std::format(" {}={:X}", stu->to_editable().get_argument_primitive("m_mapName").get_value<const char*>(), stu->to_editable().get_argument_resource("m_map")->resource_id);
+		LOG_CORE(Warn, "[AUTOTEST] no map matching '{}'. Maps:{}\n", wanted, names);
 		return 0;
 	}
 
@@ -602,8 +625,10 @@ namespace auto_test {
 				//so only record it (pressing hero_select does not close it).
 				s_hero_report["hero_select_open"] = hero_select_active();
 				s_hero_report["background_states"] = s_noise.size();
-				if (s_hero == 0)
+				if (s_hero == 0) {
 					dump_requested_stus(); //Again, now that the map and the first hero are loaded
+					dump_map_entities();
+				}
 				LOG_CORE(Info, "[AUTOTEST] {}: {} states change on their own\n", s_heroes[s_hero].name, s_noise.size());
 				start_press();
 			}

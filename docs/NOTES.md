@@ -177,3 +177,24 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   Not handled yet: ejecting into the pilot when the mech dies, and the pilot sitting in the cockpit (3rd person).
 - Upstream: PR saturn-xvi/prometheus#39 (per-hero health) leaves D.Va out ("meka handled separately");
   issue saturn-xvi/prometheus#35 also calls D.Va "more complex".
+
+## One-click Play and map spawn points (2026-10-18)
+
+- **Spawn points are map entities with component `0x2E`**, 6 per spawn room (one per player), all resource
+  `0x400000000000001`. Their `Component_1_SceneRendering` rotation is the facing direction as a quaternion.
+  Numbani has 30 (5 rooms), Hanamura 18 (3 rooms). Found with `PROMETHEUS_DUMP_MAP_ENTITIES` (Auto Test), which
+  writes every map entity with its components, mirror data type, position and rotation to `map_entities.json`.
+- The demo placed every spawned hero at a fixed Hanamura spawn spot `(108.3, 1.0, 0.14)`, so on any other map the
+  hero started outside the level and fell. `find_spawn_point()` (entity_admin.cpp) now uses the map's first spawn
+  point instead.
+- `Component_2F_LocalPlayer::SetRotation` (`0xca6fb0`) takes a full quaternion (its code is the standard
+  quaternion → rotation matrix expansion). The demo passed `(0, -0.713, 0, 0)`, which has w = 0.
+- Tested with `C:\tools\re\play_maps_test.ps1` (Play at launch, hero position logged on spawn and 5 s later):
+  Cairo, London, Kyoto, Gibraltar, Numbani, Russia, Hollywood and Mexico all spawn in a spawn room and stay there.
+- Maps in this build (`STUMapHeader` m_mapName → m_map): Cairo `0x5B`, London `0xD4`, Kyoto (Hanamura) `0x165`,
+  Gibraltar `0x184`, AutomationStressArena `0x1C2`, Numbani `0x1D4`, Russia (Volskaya) `0x1DB`, Lobby `0x223`,
+  Hollywood `0x2AF`, Mexico (Dorado) `0x2C3`, Tutorial `0x661`, login scenes `0x664`–`0x67B` (all `0x08000000000xxxxx`).
+- One-click Play (quick_play.cpp): the main menu's Play button does what the top bar's Demo + DP Load did, then the
+  matchmaking screens, map and hero. The map, the hero (also set by picking one in hero select) and "start a game
+  at launch" are saved to `Overwatch/Prometheus/play_settings.json`. The old demo flythrough moved to the top bar's
+  Play menu.

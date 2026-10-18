@@ -11,6 +11,7 @@
 #include "Components/Component_54_LobbyMap.h"
 #include "quick_play.h"
 #include "auto_test.h"
+#include "heroes.h"
 
 std::map<int, std::string> s_worldstates = {
 	{ 0, "Shutdown" },
@@ -134,20 +135,50 @@ void management_window::render() {
 			auto game_ea = GameEntityAdmin();
 			if (game_ea) {
 				auto world = get_system27_WorldEngineSystem(game_ea);
-				if (ImGui::BeginMenu("Quick Play")) {
-					ImGui::TextDisabled("Map for the main menu's Play button:");
-					for (auto& item : get_maps()) {
-						if (ImGui::MenuItem(item.first.c_str(), nullptr, quick_play::selected_map() == item.second)) {
-							quick_play::select_map(item.second);
-						}
+				if (ImGui::BeginMenu("Play")) {
+					ImGui::TextDisabled("The main menu's Play button uses these too.");
+					if (ImGui::MenuItem("Play now", nullptr, false, !quick_play::is_running())) {
+						quick_play::start_now();
+					}
+					if (ImGui::MenuItem("Start a game when Overwatch launches", nullptr, quick_play::autostart())) {
+						quick_play::set_autostart(!quick_play::autostart());
 					}
 					ImGui::Separator();
-					if (ImGui::MenuItem("Start now (skip matchmaking screens)")) {
-						quick_play::start_now();
+					auto maps = get_maps();
+					std::string map_label = "Map: ?";
+					for (auto& item : maps) {
+						if (item.second == quick_play::selected_map())
+							map_label = "Map: " + item.first;
+					}
+					if (ImGui::BeginMenu((map_label + "###PlayMap").c_str())) {
+						for (auto& item : maps) {
+							if (ImGui::MenuItem(item.first.c_str(), nullptr, quick_play::selected_map() == item.second)) {
+								quick_play::select_map(item.second);
+							}
+						}
+						ImGui::EndMenu();
+					}
+					auto hero = find_hero(quick_play::selected_hero());
+					std::string hero_label = std::string("Hero: ") + (hero ? hero->name : "pick in hero select");
+					if (ImGui::BeginMenu((hero_label + "###PlayHero").c_str())) {
+						if (ImGui::MenuItem("Pick in hero select", nullptr, quick_play::selected_hero() == 0)) {
+							quick_play::select_hero(0);
+						}
+						ImGui::Separator();
+						for (auto& item : HEROES) {
+							if (ImGui::MenuItem(item.name, nullptr, quick_play::selected_hero() == item.id)) {
+								quick_play::select_hero(item.id);
+							}
+						}
+						ImGui::EndMenu();
 					}
 					ImGui::Separator();
 					if (ImGui::MenuItem("Auto Test all heroes", nullptr, false, !auto_test::is_running())) {
 						auto_test::start();
+					}
+					if (ImGui::MenuItem("Original demo (lobby flythrough, then Hanamura)")) {
+						globals::isDemo = true;
+						PrometheusSystem::instance()->demo_join_game = true;
 					}
 
 					ImGui::EndMenu();

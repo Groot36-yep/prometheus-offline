@@ -34,6 +34,7 @@ add_library(Prometheus-Core SHARED
         "player_spawner.h"
         "quick_play.h"
         "auto_test.h"
+        "heroes.h"
         "UI/search_helper.h"
         "serialization.h"
         "Statescript.h"
