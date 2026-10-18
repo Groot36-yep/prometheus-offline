@@ -489,22 +489,66 @@ namespace auto_test {
 		return ids;
 	}
 
-	//Entities created since the press (projectiles, deployables, effects), by resource id with a count.
+	//Entities created since the press (projectiles, deployables, effects), by resource id with a count, and how long
+	//the ones with a resource id lived (a projectile that hits a wall or the floor goes away at once; one that flies
+	//through lives until its lifetime ends).
+	struct NewEntity {
+		std::string resource;
+		double born;
+		double died = -1;
+		std::set<std::string> scripts{};
+	};
 	static std::set<uint> s_entities_before{};
-	static std::map<uint, std::string> s_new_entities{};
+	static std::map<uint, NewEntity> s_new_entities{};
 
 	static void track_new_entities() {
+		auto now = GetGameRuntimeSecs();
+		std::set<uint> alive{};
 		for (auto ent : *GameEntityAdmin()) {
-			if (!s_entities_before.contains(ent->entity_id) && !s_new_entities.contains(ent->entity_id))
-				s_new_entities.emplace(ent->entity_id, entity_resource(ent));
+			alive.insert(ent->entity_id);
+			if (s_entities_before.contains(ent->entity_id))
+				continue;
+			auto it = s_new_entities.find(ent->entity_id);
+			if (it == s_new_entities.end())
+				it = s_new_entities.emplace(ent->entity_id, NewEntity{ entity_resource(ent), now }).first;
+			if (auto ss = ent->getById<Component_23_Statescript>(0x23)) {
+				for (auto inst : ss->ss_inner)
+					it->second.scripts.insert(std::format("{:X}", inst->script_id));
+			}
 		}
+		for (auto& [id, entity] : s_new_entities) {
+			if (entity.died < 0 && !alive.contains(id))
+				entity.died = now;
+		}
+	}
+
+	//Scripts the created entities ran, e.g. a projectile's impact logic.
+	static nlohmann::json new_entity_scripts_json() {
+		std::set<std::string> scripts{};
+		for (auto& [id, entity] : s_new_entities)
+			scripts.insert(entity.scripts.begin(), entity.scripts.end());
+		return scripts;
 	}
 
 	static nlohmann::json new_entities_json() {
 		std::map<std::string, int> counts{};
-		for (auto& [id, resource] : s_new_entities)
-			counts[resource]++;
+		for (auto& [id, entity] : s_new_entities)
+			counts[entity.resource]++;
 		return counts;
+	}
+
+	//Seconds each entity with a resource id lived, or "alive" if it outlived the observation.
+	static nlohmann::json new_entity_lifetimes_json() {
+		nlohmann::json out = nlohmann::json::object();
+		for (auto& [id, entity] : s_new_entities) {
+			if (entity.resource.starts_with("?"))
+				continue;
+			if (entity.died < 0)
+				out[entity.resource].push_back("alive");
+			else
+				out[entity.resource].push_back(std::round((entity.died - entity.born) * 100) / 100);
+		}
+		return out;
 	}
 
 	static void start_press() {
@@ -539,6 +583,8 @@ namespace auto_test {
 			if (s_action == 0) {
 				s_hero_report["fire"] = s_fire_ok;
 				s_hero_report["fire_entities"] = new_entities_json();
+				s_hero_report["fire_lifetimes"] = new_entity_lifetimes_json();
+				s_hero_report["fire_scripts"] = new_entity_scripts_json();
 				LOG_CORE(Info, "[AUTOTEST] {} fire: {}\n", hero.name, s_fire_ok ? "reacts" : "NO reaction");
 			}
 			else {
@@ -563,7 +609,8 @@ namespace auto_test {
 			}
 			s_hero_report["abilities"].push_back({ { "button", action.button }, { "reacted", s_reactions > 0 },
 				{ "state_changes", s_reactions }, { "left_running", left }, { "started", started },
-				{ "entities", new_entities_json() } });
+				{ "entities", new_entities_json() }, { "lifetimes", new_entity_lifetimes_json() },
+				{ "scripts", new_entity_scripts_json() } });
 		}
 
 		s_action++;
@@ -724,6 +771,13 @@ namespace auto_test {
 					break;
 				}
 				s_hero_report["spawned"] = true;
+				//"pitch=<degrees>" tilts the view before the presses, e.g. at the floor to see whether projectiles hit it
+				//(rotation about the X axis, as a quaternion like Component_2F_LocalPlayer::SetRotation takes).
+				if (auto pos = s_options.find("pitch="); pos != std::string::npos) {
+					float radians = std::stof(s_options.substr(pos + 6)) * 3.14159265f / 180.f;
+					if (auto local = GameEntityAdmin()->getLocalEnt()->getById<Component_2F_LocalPlayer>(0x2F))
+						local->SetRotation(Vector4(std::sin(radians / 2), 0, 0, std::cos(radians / 2)));
+				}
 				//The game opens hero select by itself. It does not block the button events sent to the hero's scripts,
 				//so only record it (pressing hero_select does not close it).
 				s_hero_report["hero_select_open"] = hero_select_active();
