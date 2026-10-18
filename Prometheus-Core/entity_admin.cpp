@@ -18,6 +18,7 @@
 #include "statescript_logger.h"
 #include "quick_play.h"
 #include "auto_test.h"
+#include "display.h"
 #include <set>
 #include <deque>
 
@@ -117,6 +118,24 @@ static bool find_spawn_point(Vector4& position, Vector4& rotation) {
 	position.W = 0;
 	rotation = sr->rotation; //Quaternion, which is what Component_2F_LocalPlayer::SetRotation takes (0xca6fb0)
 	return true;
+}
+
+//Spawn room doors run script 0x5800000000000F6, which destroys its own entity when the server sends game message
+//0x240000000000071 (the match starting). Offline nothing sends it, so heroes were shut in the spawn room; do what
+//the script does. Returns how many doors were removed (0 once they are gone).
+static int open_spawn_doors() {
+	constexpr __int64 SPAWN_DOOR_SCRIPT = 0x5800000000000F6;
+	std::vector<Entity*> doors{};
+	for (auto ent : *GameEntityAdmin()) {
+		auto ss = ent->getById<Component_23_Statescript>(0x23);
+		if (ss && ss->ss_inner.getByResourceId(SPAWN_DOOR_SCRIPT))
+			doors.push_back(ent);
+	}
+	for (auto door : doors)
+		GameEntityAdmin()->delEnt(door);
+	if (!doors.empty())
+		LOG_CORE(Info, "Opened {} spawn room doors\n", doors.size());
+	return (int)doors.size();
 }
 
 //Main menu Play button. The original demo (lobby map flythrough, then Hanamura) is in the top bar's Play menu.
@@ -1320,6 +1339,7 @@ void PrometheusSystem::OnTick(float tick) {
 	}
 	quick_play::tick(_input_component);
 	auto_test::tick(_input_component);
+	display::tick();
 	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/
@@ -1505,6 +1525,8 @@ void PrometheusSystem::OnTick(float tick) {
 			cv.value = 1;
 			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, cv);*/
 			Vector4 spawn_pos{}, spawn_rot{};
+			if (globals::isDemo)
+				open_spawn_doors();
 			if (globals::isDemo && find_spawn_point(spawn_pos, spawn_rot)) {
 				auto localplayer = controller->getById<Component_2F_LocalPlayer>(0x2F);
 				localplayer->SetRotation(spawn_rot);

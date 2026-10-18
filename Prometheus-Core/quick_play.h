@@ -23,6 +23,9 @@ namespace quick_play {
 	void start_from_menu();
 	//Same without the matchmaking screens (top bar).
 	void start_now();
+	//Selects the map and loads it right away, also from inside a game: removes the hero first (unloading a map
+	//with our hero in it crashes), then spawns the hero on the new map.
+	void switch_map(__int64 map_id);
 	bool is_running();
 
 	//True while the matchmaking screens are shown (drives the game's "is matchmaking" config var).

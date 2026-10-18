@@ -8,6 +8,8 @@
 #include "statescript_logger.h"
 #include "stu_resources.h"
 #include "stringhash_library.h"
+#include "UI/imgui_helpers.h"
+#include "UI/windows/ini_settings_window.h"
 #include "Logs/Logs.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -78,6 +80,9 @@ namespace auto_test {
 	static std::string s_options{};
 	static std::vector<Hero> s_heroes{};
 	static size_t s_hero = 0;
+	static std::vector<__int64> s_maps{};
+	static size_t s_map_index = 0;
+	static __int64 s_map = 0;
 	static size_t s_action = 0;
 	static int s_spawn_attempts = 0;
 	static double s_hero_data_seen = -1;
@@ -201,9 +206,11 @@ namespace auto_test {
 		file << s_report.dump(2);
 	}
 
-	static __int64 requested_map(const std::string& options);
+	static std::vector<__int64> requested_maps(const std::string& options);
 
 	static void load_map() {
+		if (s_map_index == 0)
+			s_maps = requested_maps(s_options);
 		auto lobby_ss = LobbyEntityAdmin()->getSingletonComponent<Component_23_Statescript>(0x23);
 		if (lobby_ss) {
 			for (auto script_id : LOBBY_SCRIPTS_TO_STOP) {
@@ -213,11 +220,10 @@ namespace auto_test {
 		}
 		auto world = get_system27_WorldEngineSystem(GameEntityAdmin());
 		PrometheusSystem::instance()->DeleteLocalEnt(); //Changing maps with a hero spawned crashes on unload
-		auto map = requested_map(s_options);
-		if (!map)
-			map = quick_play::selected_map();
+		auto map = s_map_index < s_maps.size() ? s_maps[s_map_index] : quick_play::selected_map();
 		world->wanted_map_id = map;
 		world->world_state = 2;
+		s_map = map;
 		s_report["map"] = std::format("{:X}", map);
 		LOG_CORE(Info, "[AUTOTEST] loading map {:X}\n", map);
 		set_step(Step::Loading);
@@ -236,7 +242,8 @@ namespace auto_test {
 	static void spawn_hero() {
 		auto& hero = s_heroes[s_hero];
 		if (s_spawn_attempts == 0)
-			s_hero_report = { { "name", hero.name }, { "id", std::format("{:X}", hero.id) }, { "abilities", nlohmann::json::array() } };
+			s_hero_report = { { "name", hero.name }, { "id", std::format("{:X}", hero.id) }, { "map", std::format("{:X}", s_map) },
+				{ "abilities", nlohmann::json::array() } };
 		s_spawn_attempts++;
 		PrometheusSystem::instance()->DeleteLocalEnt();
 		auto hero_stu = stu_resources::GetByID(hero.id);
@@ -298,6 +305,10 @@ namespace auto_test {
 			case STU_ConstraintType_ResourceRef:
 			case STU_ConstraintType_NonSTUResourceRef:
 				j[name] = resref_json(object.get_argument_resource(arg));
+				break;
+			case STU_ConstraintType_Primitive:
+			case STU_ConstraintType_Enum: //First 4 bytes as an int; enough to tell teams, flags and counts apart
+				j[name] = object.get_argument_primitive(arg).get_value<int>();
 				break;
 			case STU_ConstraintType_BSList_Object:
 			case STU_ConstraintType_BSList_InlinedObject: {
@@ -383,6 +394,11 @@ namespace auto_test {
 				e["pos"] = { sr->position.X, sr->position.Y, sr->position.Z };
 				e["rot"] = { sr->rotation.X, sr->rotation.Y, sr->rotation.Z, sr->rotation.W };
 			}
+			if (auto ss = ent->getById<Component_23_Statescript>(0x23)) {
+				auto& scripts = e["scripts"] = nlohmann::json::array();
+				for (auto inst : ss->ss_inner)
+					scripts.push_back(std::format("{:X}", inst->script_id));
+			}
 			auto& comps = e["components"] = nlohmann::json::object();
 			for (int i = 0; i < ent->component_list.num - 1; i++) {
 				auto compo = ent->component_list.ptr[i];
@@ -391,7 +407,7 @@ namespace auto_test {
 				auto mirror = (STUBase<>*)compo->GetMirrorData();
 				std::string type = mirror ? hash_name(mirror->vfptr->GetSTUInfo()->Hash) : "";
 				auto key = std::format("{:X}", compo->component_id);
-				if (mirror && compo->component_id == 0x2E) //Spawn point
+				if (mirror && (compo->component_id == 0x2E || compo->component_id == 0x40)) //Spawn point, spawn room volumes
 					comps[key] = stu_json(mirror->to_editable(), 3);
 				else if (type.find("Spawn") != std::string::npos)
 					comps[key] = stu_json(mirror->to_editable(), 2);
@@ -404,8 +420,32 @@ namespace auto_test {
 		LOG_CORE(Info, "[AUTOTEST] wrote map_entities.json ({} entities)\n", out.size());
 	}
 
+	//Debug: with PROMETHEUS_DUMP_INI set, the game's ini settings (name, value as parsed, int value) go to
+	//Prometheus/ini_dump.json, the same list the Ini Settings window shows.
+	static void dump_ini() {
+		auto env = getenv("PROMETHEUS_DUMP_INI");
+		if (!env || !*env)
+			return;
+		auto list = *(ini_settings_window::iniSetting***)(globals::gameBase + 0x1859ed0);
+		int count = *(int*)(globals::gameBase + 0x1859ed0 + 8);
+		nlohmann::json out = nlohmann::json::array();
+		for (int i = 0; i < count; i++) {
+			auto ini = list[i];
+			nlohmann::json e = { { "name", ini->setting_name.get() }, { "parsed", ini->parsed_value.get() }, { "type", ini->ini_type },
+				{ "address", std::format("{:X}", (__int64)ini - globals::gameBase) } };
+			if (ini->intVal && (ini->ini_type == 1 || ini->ini_type == 3))
+				e["value"] = *ini->charVal;
+			else if (ini->intVal && ini->ini_type == 2)
+				e["value"] = *ini->intVal;
+			out.push_back(e);
+		}
+		std::ofstream("./Prometheus/ini_dump.json", std::ios::trunc) << out.dump(1);
+		LOG_CORE(Info, "[AUTOTEST] wrote ini_dump.json ({} settings)\n", out.size());
+	}
+
 	static void dump_requested_stus() {
 		dump_entities();
+		dump_ini();
 		auto env = getenv("PROMETHEUS_DUMP_STU");
 		if (!env || !*env)
 			return;
@@ -496,23 +536,40 @@ namespace auto_test {
 			set_step(Step::Gap);
 	}
 
-	//"map=<part of the map's path or name>" in the hero list picks the map, e.g. "dva,map=numbani".
-	static __int64 requested_map(const std::string& options) {
-		auto pos = options.find("map=");
-		if (pos == std::string::npos)
-			return 0;
-		auto wanted = options.substr(pos + 4, options.find(',', pos) - pos - 4);
+	//Map whose path contains `wanted` (playable maps before login scenes), 0 if none.
+	static __int64 find_map(const std::string& wanted) {
+		__int64 found = 0;
 		for (auto& [id, stu] : stu_resources::GetIfAssignableTo(stringHash("STUMapHeader"))) {
 			auto header = stu->to_editable();
 			std::string name = lower(header.get_argument_primitive("m_mapName").get_value<const char*>());
-			if (name.find(wanted) != std::string::npos)
-				return header.get_argument_resource("m_map")->resource_id;
+			if (name.find(wanted) == std::string::npos)
+				continue;
+			found = header.get_argument_resource("m_map")->resource_id;
+			if (name.find("login") == std::string::npos)
+				return found;
 		}
+		if (found)
+			return found;
 		std::string names{};
 		for (auto& [id, stu] : stu_resources::GetIfAssignableTo(stringHash("STUMapHeader")))
 			names += std::format(" {}={:X}", stu->to_editable().get_argument_primitive("m_mapName").get_value<const char*>(), stu->to_editable().get_argument_resource("m_map")->resource_id);
 		LOG_CORE(Warn, "[AUTOTEST] no map matching '{}'. Maps:{}\n", wanted, names);
 		return 0;
+	}
+
+	//"map=<part of the map's path>" in the hero list picks the map, e.g. "dva,map=numbani". Several maps separated by
+	//'+' are played one after another in the same session (which also tests switching maps), e.g. "map=numbani+kyoto".
+	static std::vector<__int64> requested_maps(const std::string& options) {
+		std::vector<__int64> maps{};
+		auto pos = options.find("map=");
+		if (pos == std::string::npos)
+			return maps;
+		std::stringstream names(options.substr(pos + 4, options.find(',', pos) - pos - 4));
+		for (std::string name; std::getline(names, name, '+');) {
+			if (auto map = find_map(name))
+				maps.push_back(map);
+		}
+		return maps;
 	}
 
 	void start(const std::string& heroes, bool exit_when_done) {
@@ -527,6 +584,9 @@ namespace auto_test {
 		}
 		s_exit_when_done = exit_when_done;
 		s_hero = 0;
+		s_maps.clear();
+		s_map_index = 0;
+		s_map = get_system27_WorldEngineSystem(GameEntityAdmin())->loaded_map_id;
 		s_report = { { "map", std::format("{:X}", quick_play::selected_map()) }, { "heroes", nlohmann::json::array() } };
 		LOG_CORE(Info, "[AUTOTEST] starting: {} heroes\n", s_heroes.size());
 		auto world = get_system27_WorldEngineSystem(GameEntityAdmin());
@@ -598,6 +658,12 @@ namespace auto_test {
 			break;
 		}
 		case Step::Spawn:
+			if (s_hero >= s_heroes.size() && s_map_index + 1 < s_maps.size()) {
+				s_map_index++;
+				s_hero = 0;
+				load_map(); //Next map, with every hero again
+				break;
+			}
 			if (s_hero >= s_heroes.size()) {
 				LOG_CORE(Info, "[AUTOTEST] done, report written to {}\n", REPORT_PATH);
 				stop();

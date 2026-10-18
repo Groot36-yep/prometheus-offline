@@ -198,3 +198,27 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   matchmaking screens, map and hero. The map, the hero (also set by picking one in hero select) and "start a game
   at launch" are saved to `Overwatch/Prometheus/play_settings.json`. The old demo flythrough moved to the top bar's
   Play menu.
+
+## Spawn room doors, map switching, borderless window (2026-10-18)
+
+- **Spawn room doors** are map entities running script `0x5800000000000F6` (11 nodes): on game message
+  `0x240000000000071` (the match starting) a condition gates `STUStatescriptActionDestroyEntity(GetOwner)`, so the
+  door deletes itself. Offline nothing sends the message, so heroes were shut in. `open_spawn_doors()`
+  (entity_admin.cpp) deletes those entities when the hero spawns: 26 on Hanamura, then 0 for later spawns.
+  Spawn points' own component data (`0x2E`, mirror type `2256DF7B`) has a single field that is 0 everywhere; the
+  team is not in it.
+- **Switching maps** works as long as the local hero is deleted before the map unloads. Auto Test now takes
+  `map=numbani+kyoto+mexico` and plays every map in one session (tested, no crash). The top bar's Map menu and
+  the Play menu's map list go through `quick_play::switch_map()` when a hero is in the game.
+- **Borderless window**: the beta reads no settings file (every ini setting shows `parsed: <none>`) and starts in
+  exclusive fullscreen (`IDXGISwapChain::GetFullscreenState`). Display settings are static bool setting objects:
+  `Render.WindowedFullscreen` at RVA `0x17A4CC0`, `Render.FullscreenWindow` at `0x17A4D30` (value at +0x38,
+  runtime ini copy at +0x8 → value pointer +0x90, callback at +0x40 with argument +0x48). The Video options apply
+  (`0x85D270`) and the setter `0x85EC00` set them and call vfunc `0x598` on the renderer at `0x181E3E0`.
+  `display.cpp` sets WindowedFullscreen = 1 the same way: exclusive fullscreen goes from yes to no and the window
+  stays 2560×1440 without borders. The game state tick (`0xBFF460`) can force FullscreenWindow back to 1 under
+  some flags, so display.cpp keeps checking.
+- The user's `Documents\Overwatch\Settings\Settings_v0.ini` belongs to the live game (last written April 2026, before
+  any beta run) and must not be edited.
+- Found with Ghidra headless (`C:\tools\re\ghidra_headless.ps1`, scripts StringRefs/RefsTo on project `OW08`) and
+  new Auto Test dumps: `PROMETHEUS_DUMP_INI` (ini settings) and the map dump's script ids.

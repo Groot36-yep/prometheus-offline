@@ -12,6 +12,7 @@
 #include "quick_play.h"
 #include "auto_test.h"
 #include "heroes.h"
+#include "display.h"
 
 std::map<int, std::string> s_worldstates = {
 	{ 0, "Shutdown" },
@@ -143,6 +144,9 @@ void management_window::render() {
 					if (ImGui::MenuItem("Start a game when Overwatch launches", nullptr, quick_play::autostart())) {
 						quick_play::set_autostart(!quick_play::autostart());
 					}
+					if (ImGui::MenuItem("Borderless window", nullptr, display::borderless())) {
+						display::set_borderless(!display::borderless());
+					}
 					ImGui::Separator();
 					auto maps = get_maps();
 					std::string map_label = "Map: ?";
@@ -151,9 +155,14 @@ void management_window::render() {
 							map_label = "Map: " + item.first;
 					}
 					if (ImGui::BeginMenu((map_label + "###PlayMap").c_str())) {
+						bool in_game = world->world_state == 8 && game_ea->getLocalEnt();
+						ImGui::TextDisabled(in_game ? "Click a map to switch to it now." : "Loaded by Play.");
 						for (auto& item : maps) {
 							if (ImGui::MenuItem(item.first.c_str(), nullptr, quick_play::selected_map() == item.second)) {
-								quick_play::select_map(item.second);
+								if (in_game)
+									quick_play::switch_map(item.second);
+								else
+									quick_play::select_map(item.second);
 							}
 						}
 						ImGui::EndMenu();
@@ -186,8 +195,13 @@ void management_window::render() {
 				if (ImGui::BeginMenu("Map")) {
 					for (auto& item : get_maps()) {
 						if (ImGui::MenuItem(item.first.c_str())) {
-							world->wanted_map_id = item.second;
-							world->world_state = 2;
+							if (game_ea->getLocalEnt()) {
+								quick_play::switch_map(item.second); //Removes the hero first; unloading with it crashes
+							}
+							else {
+								world->wanted_map_id = item.second;
+								world->world_state = 2;
+							}
 						}
 					}
 

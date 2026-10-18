@@ -223,6 +223,13 @@ namespace quick_play {
 		start(false);
 	}
 
+	void switch_map(__int64 map_id) {
+		select_map(map_id);
+		LOG_CORE(Info, "Quick Play: switching to map {:X}\n", map_id);
+		set_step(Step::Idle); //Cancels a Play in progress
+		start(false);
+	}
+
 	bool is_running() {
 		return s_step != Step::Idle;
 	}
