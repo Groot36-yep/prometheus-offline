@@ -222,3 +222,8 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   any beta run) and must not be edited.
 - Found with Ghidra headless (`C:\tools\re\ghidra_headless.ps1`, scripts StringRefs/RefsTo on project `OW08`) and
   new Auto Test dumps: `PROMETHEUS_DUMP_INI` (ini settings) and the map dump's script ids.
+- **TODO when game modes are emulated:** removing every door at spawn skips the setup phase (attackers could leave
+  early) and skips the door script's own condition (`EC502A81`, not decoded yet), which decides which doors open.
+  26 entities run the script on Hanamura but only 8 are near spawn rooms, so a few may be other pre-match
+  barriers. Once a game mode runs, turn `open_spawn_doors()` off and instead send game message
+  `0x240000000000071` when setup ends (the host in LAN), so each door decides for itself.
