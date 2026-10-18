@@ -1216,7 +1216,7 @@ void PrometheusSystem::OnTick(float tick) {
 	if (_input_component) {
 		trace_logical_buttons(_input_component);
 	}
-	else {
+	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/
 
