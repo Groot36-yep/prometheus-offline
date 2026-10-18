@@ -51,7 +51,7 @@ std::shared_ptr<state_replicator::MsgBase> state_replicator::get_outstanding_mes
 	//	//printf("outstanding msg: %d\n", msg->type);
 	//	return msg;
 	//}
-	//return std::shared_ptr<state_replicator::MsgBase>{ new NoneMessage };
+	return std::shared_ptr<state_replicator::MsgBase>{ new NoneMessage };
 }
 
 void state_replicator::emplace_positon_update(MovementState* state) {
