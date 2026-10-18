@@ -257,3 +257,23 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
 - No component stores ultimate charge; it is most likely a statescript variable on the hero that the server
   raises. Next: enumerate the hero's varbag (the Varbag Window is an empty stub) and find the variable the
   ultimate's start condition reads.
+
+## Script-started volleys (ability projectiles, 2026-10-18)
+
+- Concussive Blast (`0x58000000000007B`), Fire Strike (`0x5800000000000E2`) and Symmetra's orb (`0x580000000000139`)
+  are volleys an ability's script starts (Ability -> State -> Wait -> Volley), not held fire. Two server-side
+  inputs were missing:
+  1. The weapon state start `0x1077B30` (volley on-start, via thunk `0xD44B50`) ends the state at once when the
+     shooter lacks component `0x26` or **bit 3 of the script instance flags (`+0x258`)** is clear. Weapon scripts
+     have flags `0x600089`; ability scripts `0x400081`, so their volleys are left to the server.
+  2. The volley update `0xD44D60` fires only when its command (`+0xd0`, looked up from the weapon's commands by
+     `0x10798F0`) has type 3 (server) or its **fire flag `+0x108`** is set. Held fire has it (input); the command
+     a volley creates for itself on start (`0x1078A10` -> `0x10451C0`) does not.
+- Fix (entity_admin.cpp): `weapon_state_start_hook` sets bit 3 for the start call of volleys (vtable `0x15D2450`);
+  `volley_update_hook` marks a volley whose first update finds its command without the fire flag as script-started
+  and sets the flag for that activation. Auto Test: Fire Strike, Concussive Blast and Symmetra's orb now create
+  projectile entities; Hanzo's and Junkrat's abilities still do.
+- Shot commands otherwise arrive as network messages: `0xD44EE0` dequeues them per tick and `0x1079BC0` reads
+  them from a bitstream.
+- Tracing with `auto_test` `started` (every state an ability press starts, with node types) showed the volleys
+  starting and finishing within a tick; graph dump node indexes are not runtime state indexes (`idx_in_m_states`).

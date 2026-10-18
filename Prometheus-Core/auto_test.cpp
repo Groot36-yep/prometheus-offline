@@ -553,15 +553,17 @@ namespace auto_test {
 		}
 		else {
 			nlohmann::json left = nlohmann::json::array();
+			nlohmann::json started = nlohmann::json::array();
 			for (auto& key : s_started) {
-				auto it = s_running.find(key);
-				if (it == s_running.end())
-					continue;
-				left.push_back({ { "script", std::format("{:X}", key.first->script_id) }, { "node", key.second },
-					{ "type", std::format("{:08X}", it->second) } });
+				nlohmann::json state = { { "script", std::format("{:X}", key.first->script_id) }, { "node", key.second },
+					{ "type", std::format("{:08X}", node_type(key.first, key.second)) } };
+				started.push_back(state);
+				if (s_running.contains(key))
+					left.push_back(state);
 			}
 			s_hero_report["abilities"].push_back({ { "button", action.button }, { "reacted", s_reactions > 0 },
-				{ "state_changes", s_reactions }, { "left_running", left }, { "entities", new_entities_json() } });
+				{ "state_changes", s_reactions }, { "left_running", left }, { "started", started },
+				{ "entities", new_entities_json() } });
 		}
 
 		s_action++;

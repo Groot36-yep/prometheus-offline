@@ -798,6 +798,58 @@ static __int64 __fastcall create_projectile_hook(__int64* callbacks, void* shot,
 	return projectile;
 }
 
+//Volleys started by an ability's script (Concussive Blast, Fire Strike, Symmetra's orb) never fired. Their shots
+//need two things the server provides:
+//- The weapon state start (0x1077B30, the volley's on-start) ends the state at once unless bit 3 of the script
+//  instance's flags (+0x258) is set. The hero's weapon scripts have it (0x600089); ability scripts do not
+//  (0x400081), so the server runs their volleys. Set it for the start call.
+//- The volley update (0xD44D60) fires only when its command (+0xd0) has type 3 (sent by the server) or its
+//  "fire" flag (+0x108) is set. Held fire sets the flag through input; a volley the script starts creates its own
+//  command without it. So if a volley's first update finds its command without the flag, it was started by a
+//  script: set the flag for that activation, and the volley fires its configured shots.
+static constexpr __int64 RVA_WEAPON_STATE_START = 0x1077B30;
+static constexpr __int64 RVA_VOLLEY_UPDATE = 0xD44D60;
+static constexpr __int64 RVA_VOLLEY_LOOKUP_COMMAND = 0x10798F0; //Fills +0xd0 from the weapon's commands, as the update does
+static constexpr __int64 RVA_VOLLEY_VTABLE = 0x15D2450;
+static constexpr int INSTANCE_FLAGS = 0x258;
+static constexpr uint32_t INSTANCE_RUNS_WEAPON_STATES = 1 << 3;
+static constexpr int VOLLEY_COMMAND = 0xd0;
+static constexpr int COMMAND_TYPE_FROM_SERVER = 3;
+static constexpr int COMMAND_FIRE = 0x108;
+
+static void(__fastcall* s_weapon_state_start_orig)(StatescriptState*) = nullptr;
+static void(__fastcall* s_volley_update_orig)(StatescriptState*) = nullptr;
+static std::set<StatescriptState*> s_volleys_starting{};  //Started, first update not seen yet
+static std::set<StatescriptState*> s_script_volleys{};    //Started by a script: their command gets the fire flag
+
+static void __fastcall weapon_state_start_hook(StatescriptState* state) {
+	if ((__int64)state->vfptr != globals::gameBase + RVA_VOLLEY_VTABLE) {
+		s_weapon_state_start_orig(state);
+		return;
+	}
+	s_script_volleys.erase(state);
+	s_volleys_starting.insert(state);
+	auto flags = (uint32_t*)((char*)state->ss_instance + INSTANCE_FLAGS);
+	bool lent = !(*flags & INSTANCE_RUNS_WEAPON_STATES);
+	if (lent)
+		*flags |= INSTANCE_RUNS_WEAPON_STATES;
+	s_weapon_state_start_orig(state); //Also runs the first update
+	if (lent)
+		*flags &= ~INSTANCE_RUNS_WEAPON_STATES;
+	s_volleys_starting.erase(state);
+}
+
+static void __fastcall volley_update_hook(StatescriptState* state) {
+	((void(__fastcall*)(StatescriptState*))(globals::gameBase + RVA_VOLLEY_LOOKUP_COMMAND))(state);
+	auto command = *(__int64*)((char*)state + VOLLEY_COMMAND);
+	if (command && s_volleys_starting.erase(state) && *(int*)(command + SHOT_COMMAND_TYPE) != COMMAND_TYPE_FROM_SERVER
+		&& !*(char*)(command + COMMAND_FIRE))
+		s_script_volleys.insert(state);
+	if (command && s_script_volleys.contains(state))
+		*(char*)(command + COMMAND_FIRE) = 1;
+	s_volley_update_orig(state);
+}
+
 static double timed_wait_duration(StatescriptState* state) {
 	auto node = state_stu_node(state);
 	if (!node || !*(__int64*)(node + 0x100))
@@ -1089,6 +1141,10 @@ void PrometheusSystem::OnTick(float tick) {
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER)));
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE), (LPVOID)create_projectile_hook, (PVOID*)&s_create_projectile_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_VOLLEY_UPDATE), (LPVOID)volley_update_hook, (PVOID*)&s_volley_update_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_VOLLEY_UPDATE)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_WEAPON_STATE_START), (LPVOID)weapon_state_start_hook, (PVOID*)&s_weapon_state_start_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_WEAPON_STATE_START)));
 	}
 
 	if (!_applied_quick_play) {
