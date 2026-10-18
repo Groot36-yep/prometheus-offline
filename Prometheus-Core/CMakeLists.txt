@@ -102,6 +102,7 @@ add_library(Prometheus-Core SHARED
         "UI/windows/statescript_list.h"
         "UI/windows/statescript_log_window.h"
         "UI/windows/statescript_node_search.h"
+        "UI/windows/statescript_graph_scanner.h"
         "UI/windows/statescript_registry.h"
         "UI/windows/statescript_varbag_window.h"
         "UI/windows/statescript_window.h"

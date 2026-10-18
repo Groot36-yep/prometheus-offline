@@ -47,6 +47,7 @@
 #include "../windows/entityadmin_timing.h"
 #include "../windows/statescript_fake_logicalbtn.h"
 #include "../windows/statescript_node_search.h"
+#include "../windows/statescript_graph_scanner.h"
 #include "../windows/cvexpression_viewer.h"
 #include "../windows/CVD_List.h"
 #include "../windows/CVD_VarbagSelector.h"
