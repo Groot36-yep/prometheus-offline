@@ -15,6 +15,7 @@
 #include "TimeScale.h"
 #include "Logs/Logs.h"
 #include "Components/Component_54_LobbyMap.h"
+#include "quick_play.h"
 
 __int64 PrometheusSystem::get_inheritance() {
 	return NULL;
@@ -97,7 +98,10 @@ string_rep* get_displayString_func(string_rep* a1, __int64 id, __int64 a3) {
 }
 
 void play_game_btn() {
-	PrometheusSystem::instance()->demo_join_game = true;
+	if (globals::isDemo)
+		PrometheusSystem::instance()->demo_join_game = true;
+	else
+		quick_play::start_from_menu();
 }
 
 //0xd774b0
@@ -144,7 +148,7 @@ char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, Sta
 //0xd94930
 char matchmaking_cv(__int64, __int64, __int64, StatescriptPrimitive* result) {
 	result->type = StatescriptPrimitive_BYTE;
-	result->value = PrometheusSystem::instance()->demo_join_game;
+	result->value = PrometheusSystem::instance()->demo_join_game || quick_play::is_matchmaking();
 	return 1;
 }
 
@@ -701,6 +705,16 @@ void PrometheusSystem::OnTick(float tick) {
 		}
 	}
 
+	if (!_applied_quick_play) {
+		_applied_quick_play = true;
+		//Main menu Play button and the "is matchmaking" config var; used by Quick Play and the demo.
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xc87220), (LPVOID)play_game_btn, (PVOID*)0));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xc87220)));
+
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd94930), (LPVOID)matchmaking_cv, (PVOID*)0));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd94930)));
+	}
+
 	if (globals::isDemo) {
 		if (!_applied_demo) {
 			_applied_demo = true;
@@ -708,14 +722,8 @@ void PrometheusSystem::OnTick(float tick) {
 			//MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x8537c0), (LPVOID)get_displayString_func, (PVOID*)&get_displayString_orig));
 			//MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x8537c0)));
 
-			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xc87220), (LPVOID)play_game_btn, (PVOID*)0));
-			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xc87220)));
-
 			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd774b0), (LPVOID)SendHeroSelection, (PVOID*)0));
 			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd774b0)));
-
-			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd94930), (LPVOID)matchmaking_cv, (PVOID*)0));
-			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd94930)));
 
 			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xc45400), (LPVOID)hookSwitchCam, (PVOID*)&origSwitchCam));
 			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xc45400)));
@@ -970,7 +978,8 @@ void PrometheusSystem::OnTick(float tick) {
 	if (!_input_component) {
 		_input_component = LobbyEntityAdmin()->getSingletonComponent<Component_50_Input>(0x50);
 	}
-	else {
+	quick_play::tick(_input_component);
+	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/
 

@@ -9,6 +9,7 @@
 #include "STU_Editable.h"
 #include <shellapi.h>
 #include "Components/Component_54_LobbyMap.h"
+#include "quick_play.h"
 
 std::map<int, std::string> s_worldstates = {
 	{ 0, "Shutdown" },
@@ -132,6 +133,20 @@ void management_window::render() {
 			auto game_ea = GameEntityAdmin();
 			if (game_ea) {
 				auto world = get_system27_WorldEngineSystem(game_ea);
+				if (ImGui::BeginMenu("Quick Play")) {
+					ImGui::TextDisabled("Map for the main menu's Play button:");
+					for (auto& item : get_maps()) {
+						if (ImGui::MenuItem(item.first.c_str(), nullptr, quick_play::selected_map() == item.second)) {
+							quick_play::select_map(item.second);
+						}
+					}
+					ImGui::Separator();
+					if (ImGui::MenuItem("Start now (skip matchmaking screens)")) {
+						quick_play::start_now();
+					}
+
+					ImGui::EndMenu();
+				}
 				if (ImGui::BeginMenu("Map")) {
 					for (auto& item : get_maps()) {
 						if (ImGui::MenuItem(item.first.c_str())) {
