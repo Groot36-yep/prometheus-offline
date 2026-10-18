@@ -139,3 +139,17 @@ instance, so only ~2k of 22k config vars get a value (dynamic/expression ones an
 | | | | 168 | **scoreboard** (Tab) |
 
 Holding Tab does register as `168 scoreboard` in the input component; no loaded script listens for it.
+
+## D.Va's mech
+- `STUHero` `0x02E000000000007A`'s `m_gameplayEntity` is **`0x40A`, the pilot** (weapon slots 1–2 empty, slot 3
+  `0x2B8` = pilot's gun; graphs `0x33, 0x43, 0x4B, 0x26A, 0xB49`). Spawning that leaves D.Va as the pilot.
+- **The mech is `0x407`:** model `0x11CE` (the child the lineup/lobby entities `0x73E`/`0xDD1` attach at a hard
+  point), first person `0x41F`, weapon `0x50A`, graphs `0x33, 0x4B, 0x276, 0x2CC, 0x47E, 0x43, 0xB2F`, child
+  `0x10B4`. Nothing on the client references it (no CreateEntity-style node in D.Va's graphs, not in `STUHero`):
+  the server spawned it. Found by dumping every loaded `STUEntityDefinition` (`PROMETHEUS_DUMP_ENTITIES`, see
+  Auto Test) and matching the lobby model's child.
+- `hero_spawn_entity()` (player_spawner.h) maps D.Va to `0x407` for hero select, the state replicator and the
+  Auto Test. Auto Test (Numbani): fire, secondary (Defense Matrix), ability_1/2, ultimate and melee all `ok`.
+  Not handled yet: ejecting into the pilot when the mech dies, and the pilot sitting in the cockpit (3rd person).
+- Upstream: PR saturn-xvi/prometheus#39 (per-hero health) leaves D.Va out ("meka handled separately");
+  issue saturn-xvi/prometheus#35 also calls D.Va "more complex".

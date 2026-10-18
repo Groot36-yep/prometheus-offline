@@ -133,7 +133,7 @@ char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, Sta
 		PrometheusSystem::instance()->DeleteLocalEnt();
 
 		auto hero_stu = stu_resources::GetByID(hero_value.value);
-		auto model_entid = hero_stu->to_editable().get_argument_resource("m_gameplayEntity")->resource_id;
+		auto model_entid = hero_spawn_entity(hero_value.value, hero_stu->to_editable().get_argument_resource("m_gameplayEntity")->resource_id);
 
 		player_spawner spawner(model_entid);
 		spawner.controller_info.heroid = hero_value.value;
@@ -593,7 +593,7 @@ void PrometheusSystem::state_replicator_do() {
 				}
 				auto hero = stu_resources::GetByID(msg->heroid);
 				owassert(hero);
-				auto model_entid = hero->to_editable().get_argument_resource("m_gameplayEntity")->resource_id;
+				auto model_entid = hero_spawn_entity(msg->heroid, hero->to_editable().get_argument_resource("m_gameplayEntity")->resource_id);
 				player_spawner spawn(model_entid);
 				spawn.controller_info.heroid = model_entid;
 				spawn.controller_info.load_2f_33 = false;
