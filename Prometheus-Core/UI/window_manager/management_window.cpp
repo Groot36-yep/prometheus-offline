@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include "Components/Component_54_LobbyMap.h"
 #include "quick_play.h"
+#include "auto_test.h"
 
 std::map<int, std::string> s_worldstates = {
 	{ 0, "Shutdown" },
@@ -143,6 +144,10 @@ void management_window::render() {
 					ImGui::Separator();
 					if (ImGui::MenuItem("Start now (skip matchmaking screens)")) {
 						quick_play::start_now();
+					}
+					ImGui::Separator();
+					if (ImGui::MenuItem("Auto Test all heroes", nullptr, false, !auto_test::is_running())) {
+						auto_test::start();
 					}
 
 					ImGui::EndMenu();

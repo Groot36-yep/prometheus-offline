@@ -17,6 +17,7 @@
 #include "Components/Component_54_LobbyMap.h"
 #include "statescript_logger.h"
 #include "quick_play.h"
+#include "auto_test.h"
 #include <set>
 #include <deque>
 
@@ -1301,6 +1302,7 @@ void PrometheusSystem::OnTick(float tick) {
 		trace_logical_buttons(_input_component);
 	}
 	quick_play::tick(_input_component);
+	auto_test::tick(_input_component);
 	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/

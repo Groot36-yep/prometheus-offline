@@ -140,6 +140,30 @@ instance, so only ~2k of 22k config vars get a value (dynamic/expression ones an
 
 Holding Tab does register as `168 scoreboard` in the input component; no loaded script listens for it.
 
+## Auto Test (`auto_test.cpp`)
+
+Plays every hero without a person: start it from the top bar (Quick Play → "Auto Test all heroes") or set
+`PROMETHEUS_AUTOTEST=all,exit` (or e.g. `tracer,genji`) in the game's environment. It turns on demo mode and
+loads the lobby data packs (the top bar's "Demo" and "DP Load", which load the hero data), loads the Quick Play
+map, then per hero: spawns it like hero select does, presses fire, then each of `secondary_fire`, `ability_1`,
+`ability_2`, `ability_3` (ultimate), `quick_weapon` (melee), each followed by a fire probe. Results go to
+`Overwatch/Prometheus/auto_test_report.json` and `[AUTOTEST]` log lines; a full run of 21 heroes takes ~20 min.
+- **Input:** writing the logical button into Component 0x50's buffers is not enough for gameplay (the game turns
+  real input into Statescript `LogicalButton` notifications earlier in the frame and overwrites the buffers);
+  the test enqueues `ETYPE_LOGICALBUTTON` notifications to each of the hero's script instances (`EnqueueE`) and
+  also holds the buffers for "is held" checks.
+- **Hero select** opens by itself after spawning (`STUConfigVarIsHeroSelectActive`, getter `0xD8EE00`, stays
+  true) and pressing `hero_select` does not close it, but it does not block the notifications above.
+- **Verdicts:** `no_reaction` (no state of the hero's scripts started/ended within 1 s, ignoring states that
+  changed on their own while settling), `breaks_fire` (fire reacted before, not after), `left_running` (states
+  started by the press still run 8 s later), `ok`.
+- **First full run (2026-10-18):** fire works on all 21 heroes; Tracer is fully `ok` (Blink also listens to
+  `secondary_fire`). **`breaks_fire`: Pharah `ability_1`, D.Va `quick_weapon`.** Many `left_running` results are
+  aiming/placement modes waiting for a confirm (Reaper Shadow Step, Torbjorn turret, Symmetra turret, Mei wall:
+  `StateLogicalButton` `FF77458C`, `StateUXScreen` `C739BAAC`, `StateCosmeticEntity` `6E81F6D4`); the most common
+  other leftovers are `StateStack` `F7D6498C` (×20), unnamed `381D6654` (×17, movement abilities), and
+  `StateChaseVar` `970EC198` (×12, secondary fires). Ultimates mostly show `no_reaction` (no charge).
+
 ## D.Va's mech
 - `STUHero` `0x02E000000000007A`'s `m_gameplayEntity` is **`0x40A`, the pilot** (weapon slots 1–2 empty, slot 3
   `0x2B8` = pilot's gun; graphs `0x33, 0x43, 0x4B, 0x26A, 0xB49`). Spawning that leaves D.Va as the pilot.
