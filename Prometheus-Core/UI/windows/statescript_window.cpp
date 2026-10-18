@@ -56,6 +56,14 @@ void statescript_window::render() {
             ImGui::EndMenuBar();
         }
 
+        auto script_state = statescript_logger::GetScriptState(_curr_instance);
+        std::string running_states{};
+        for (auto& [node_idx, state] : script_state) {
+            if (!state.is_finish_state)
+                running_states += std::format("<{}> ", node_idx);
+        }
+        ImGui::Text("Running states: %s", running_states.empty() ? "(none)" : running_states.c_str());
+
         ImNodes::EditorContextSet(_nodes_context);
 
         auto& style = ImNodes::GetStyle();
@@ -66,7 +74,6 @@ void statescript_window::render() {
         ImNodes::BeginNodeEditor();
 
         int link_counter = 0;
-        auto script_state = statescript_logger::GetScriptState(_curr_instance);
         for (auto node : _curr_instance->graph->m_nodes) {
             ImGui::PushID(node);
             auto type = node->get_type();
