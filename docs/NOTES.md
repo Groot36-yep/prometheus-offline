@@ -227,3 +227,33 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   26 entities run the script on Hanamura but only 8 are near spawn rooms, so a few may be other pre-match
   barriers. Once a game mode runs, turn `open_spawn_doors()` off and instead send game message
   `0x240000000000071` when setup ends (the host in LAN), so each door decides for itself.
+
+## Projectiles (2026-10-18)
+
+- Weapon fire: `STUStatescriptStateWeaponVolley` (runtime vtable `0x15D2450`, factory `0xD43DB0`). Its update
+  (slot 36, `0xD44D60`) calls the fire-shot method (slot 78, `0xD456C0`) per pending shot. That packs the shot
+  into a job (callback `0xD455E0`), which runs `0xD45240` per projectile: reuse a projectile the server announced,
+  or create one with **`0xD354B0(callbacks, shot, &result, predicted)`**.
+- `0xD354B0` result codes: 0 created, 1 predicted + the projectile entity has a statescript component (`0x23`),
+  2 no entity, 3 load failed, 4 no projectile component (`0x27`), 8 the spawner at entity admin `+0x210` returned
+  nothing (shot command `+0x104 == 1`), 5/9/10 other checks. The job always passes predicted = 1, so scripted
+  projectiles (rockets, grenades: explosion and damage are scripted) were refused and left to the server.
+  For shot command type 1 the spawner at `+0x210` exists offline but returns nothing; other types load the entity
+  straight into the world (`prom_load`) and, when not predicted, register it through `callbacks` vfunc 1.
+- Fix (`create_projectile_hook`, entity_admin.cpp): call with predicted = 0, and for type 1 switch the command to the
+  direct-load branch for that call. Auto Test on Numbani: Pharah's fire and Junkrat's fire now create projectile
+  entities (resource ids, not just effects); no "not created" results, no crash.
+- Auto Test now records the entities created after each press (`entities` / `fire_entities`, resource id or
+  `?:<component ids>`). Effects show up as `?:1,3,D` and `?:1,3,B` for every hero; placed objects (Junkrat's
+  mine and trap) as `?:1,3,4`.
+- Not checked yet: Reinhardt's Fire Strike shows no projectile entity (may not be a volley), and nobody has
+  looked at the projectiles in game (flight, explosion, damage).
+
+## Ultimates (open)
+
+- Every ultimate shows `no_reaction` except D.Va's (her mech's ultimate worked). Only one
+  `STUStatescriptStateAbility` uses the ultimate button `0x79` as a constant (graph `0x580000000000034`, node 38);
+  most start buttons and `m_startCondition` (`EC502A81`, 35 nodes) are not recorded by the graph dump.
+- No component stores ultimate charge; it is most likely a statescript variable on the hero that the server
+  raises. Next: enumerate the hero's varbag (the Varbag Window is an empty stub) and find the variable the
+  ultimate's start condition reads.

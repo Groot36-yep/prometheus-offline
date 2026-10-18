@@ -477,7 +477,41 @@ namespace auto_test {
 		set_step(Step::LoadData);
 	}
 
+	//Resource id, or the component ids for entities created at runtime without one (e.g. "?:1,3,4").
+	static std::string entity_resource(Entity* ent) {
+		if (!IsBadReadPtr(ent->resload_entry, sizeof(MisalignedResourceLoadEntry)))
+			return std::format("{:X}", ent->resload_entry->resource_id);
+		std::string ids = "?:";
+		for (int i = 0; i < ent->component_list.num - 1; i++) {
+			if (auto compo = ent->component_list.ptr[i])
+				ids += std::format("{}{:X}", ids.size() > 2 ? "," : "", compo->component_id);
+		}
+		return ids;
+	}
+
+	//Entities created since the press (projectiles, deployables, effects), by resource id with a count.
+	static std::set<uint> s_entities_before{};
+	static std::map<uint, std::string> s_new_entities{};
+
+	static void track_new_entities() {
+		for (auto ent : *GameEntityAdmin()) {
+			if (!s_entities_before.contains(ent->entity_id) && !s_new_entities.contains(ent->entity_id))
+				s_new_entities.emplace(ent->entity_id, entity_resource(ent));
+		}
+	}
+
+	static nlohmann::json new_entities_json() {
+		std::map<std::string, int> counts{};
+		for (auto& [id, resource] : s_new_entities)
+			counts[resource]++;
+		return counts;
+	}
+
 	static void start_press() {
+		s_entities_before.clear();
+		s_new_entities.clear();
+		for (auto ent : *GameEntityAdmin())
+			s_entities_before.insert(ent->entity_id);
 		s_started.clear();
 		s_reactions = 0;
 		s_press_event_sent = false;
@@ -504,6 +538,7 @@ namespace auto_test {
 			s_fire_ok = s_reactions > 0;
 			if (s_action == 0) {
 				s_hero_report["fire"] = s_fire_ok;
+				s_hero_report["fire_entities"] = new_entities_json();
 				LOG_CORE(Info, "[AUTOTEST] {} fire: {}\n", hero.name, s_fire_ok ? "reacts" : "NO reaction");
 			}
 			else {
@@ -526,7 +561,7 @@ namespace auto_test {
 					{ "type", std::format("{:08X}", it->second) } });
 			}
 			s_hero_report["abilities"].push_back({ { "button", action.button }, { "reacted", s_reactions > 0 },
-				{ "state_changes", s_reactions }, { "left_running", left } });
+				{ "state_changes", s_reactions }, { "left_running", left }, { "entities", new_entities_json() } });
 		}
 
 		s_action++;
@@ -711,6 +746,7 @@ namespace auto_test {
 			}
 			set_button(input, HERO_ACTIONS[s_action].button, true);
 			track_states(Track::Count);
+			track_new_entities();
 			if (step_elapsed() > PRESS_SECS) {
 				set_button(input, HERO_ACTIONS[s_action].button, false);
 				send_button_event(HERO_ACTIONS[s_action].button, false);
@@ -720,6 +756,7 @@ namespace auto_test {
 		case Step::Observe:
 			set_button(input, HERO_ACTIONS[s_action].button, false);
 			track_states(Track::Count);
+			track_new_entities();
 			if (GetGameRuntimeSecs() - s_press_started > REACTION_SECS) {
 				if (HERO_ACTIONS[s_action].probe)
 					finish_action();
@@ -728,6 +765,7 @@ namespace auto_test {
 			}
 			break;
 		case Step::Wait:
+			track_new_entities();
 			track_states(Track::Follow); //Follow-ups, not reactions; s_started keeps the reaction's states
 			if (GetGameRuntimeSecs() - s_press_started > ABILITY_SECS)
 				finish_action();

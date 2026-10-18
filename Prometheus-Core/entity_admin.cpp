@@ -770,6 +770,34 @@ static void __fastcall timed_wait_on_timer_hook(StatescriptState* state, int tim
 	}
 }
 
+//Projectiles: a weapon volley's shot job creates each projectile entity with 0xD354B0, passing "predicted" = 1
+//(0xD455E0 -> 0xD45240). A predicted projectile whose entity has a statescript component (Pharah's rockets,
+//Junkrat's grenades, Fire Strike: their explosion and damage are scripted) is refused with result 1 and left to
+//the server, so offline it never appeared. Not predicted, the projectile is created and registered as the
+//authoritative one (the callback at the end of 0xD354B0). Offline this client is the server, so create them all
+//that way.
+static constexpr __int64 RVA_CREATE_PROJECTILE = 0xD354B0;
+using CreateProjectileFn = __int64(__fastcall*)(__int64* callbacks, void* shot, int* result, char predicted);
+static CreateProjectileFn s_create_projectile_orig = nullptr;
+
+//Shot command (shot + 0x18), +0x104: 1 = hand the projectile to the spawner at entity admin + 0x210, which returns
+//nothing offline (result 8); other types load the projectile entity straight into the world (prom_load).
+static constexpr int SHOT_COMMAND_TYPE = 0x104;
+
+static __int64 __fastcall create_projectile_hook(__int64* callbacks, void* shot, int* result, char predicted) {
+	auto command = *(__int64*)((char*)shot + 0x18);
+	int* type = command ? (int*)(command + SHOT_COMMAND_TYPE) : nullptr;
+	bool load_directly = type && *type == 1;
+	if (load_directly)
+		*type = 2;
+	auto projectile = s_create_projectile_orig(callbacks, shot, result, 0);
+	if (load_directly)
+		*type = 1;
+	if (!projectile)
+		LOG_CORE(Info, "[TRACE] projectile not created: result {}\n", *result);
+	return projectile;
+}
+
 static double timed_wait_duration(StatescriptState* state) {
 	auto node = state_stu_node(state);
 	if (!node || !*(__int64*)(node + 0x100))
@@ -1059,6 +1087,8 @@ void PrometheusSystem::OnTick(float tick) {
 		s_applied_timed_wait_hook = true;
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER), (LPVOID)timed_wait_on_timer_hook, (PVOID*)&s_timed_wait_on_timer_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE), (LPVOID)create_projectile_hook, (PVOID*)&s_create_projectile_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE)));
 	}
 
 	if (!_applied_quick_play) {
