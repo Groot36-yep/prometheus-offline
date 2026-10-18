@@ -120,6 +120,9 @@ instance, so only ~2k of 22k config vars get a value (dynamic/expression ones an
   in game: the hero returns to the position from 3 s earlier, all Recall visuals play (gun throw anim,
   time bubble, blue rewind screen, end burst), Recall goes on cooldown, no lockout afterwards.
   Not emulated yet: health rewind (HP is stuck anyway, item 3), and the playback speed curve (linear).
+  Right after spawning the hero's position reads (0, 0, 0) for a few ticks; recording those made the first
+  Recall after a spawn drop the hero at the map origin, off the map (`rewind start: ... to (0.00 0.00 0.00)`).
+  Zero positions are now skipped, and a jump of more than 10 m in one tick restarts the history.
 - **Trace logging** (`trace_state_changes`, `trace_logical_buttons`) writes `[TRACE]` lines to
   `Overwatch/Prometheus/Logs/Prometheus_Prod.txt`: every state start/end in the local hero's scripts and
   every logical button change with its in-game name.

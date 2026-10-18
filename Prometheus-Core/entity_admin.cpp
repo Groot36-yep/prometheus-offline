@@ -853,6 +853,7 @@ static std::deque<PositionSample> s_position_history{};
 static uint s_position_history_entity = 0;
 static double s_rewind_started = -1; //Negative while no rewind is running
 static double s_landing_trace_until = -1;
+static constexpr float REWIND_MAX_STEP = 10.f; //Metres per tick; Blink is ~7 m, anything further is a teleport
 
 //The hero's current MovementState inside STUCharacterMoverComponent (0x15). Its absolute_position (+0x220)
 //is the 0xC70 offset the arrow-key teleport writes.
@@ -964,6 +965,16 @@ static void emulate_history_rewind(Entity* model, Component_23_Statescript* ss) 
 			position->Y, movement->movement_flags, movement->ticks_in_air);
 	}
 
+	//Right after spawning the position reads (0, 0, 0) until the hero is placed; recording that made an early Recall
+	//drop the hero at the map origin. A jump that large between ticks (spawn, respawn, teleport) starts a new history.
+	if (position->X == 0 && position->Y == 0 && position->Z == 0)
+		return;
+	if (!s_position_history.empty()) {
+		auto& last = s_position_history.back().position;
+		float dx = position->X - last.X, dy = position->Y - last.Y, dz = position->Z - last.Z;
+		if (dx * dx + dy * dy + dz * dz > REWIND_MAX_STEP * REWIND_MAX_STEP)
+			s_position_history.clear();
+	}
 	s_position_history.push_back({ now, *position, movement->movement_flags, movement->ticks_in_air });
 	while (!s_position_history.empty() && s_position_history.front().time < now - REWIND_HISTORY_SECS - 1.0)
 		s_position_history.pop_front();
