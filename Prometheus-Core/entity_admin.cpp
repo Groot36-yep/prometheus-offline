@@ -15,6 +15,9 @@
 #include "TimeScale.h"
 #include "Logs/Logs.h"
 #include "Components/Component_54_LobbyMap.h"
+#include "statescript_logger.h"
+#include <set>
+#include <deque>
 
 __int64 PrometheusSystem::get_inheritance() {
 	return NULL;
@@ -668,6 +671,242 @@ void PrometheusSystem::state_replicator_exhandled() {
 }
 
 
+//Some states wait for something only the server provides and never finish client-side, leaving their
+//owner's ability/movement locks active (see docs/NOTES.md, Tracer's Recall). Finish them ourselves once
+//they ran longer than they normally would.
+//  0xCD396790 (name unknown): Recall's wind-up <4> (configured with 0.1 s); without this the rewind never starts.
+//  0x7211CF70 STUStatescriptStateHistoryRewinder: Recall's rewind <1>. Normally ended by
+//             emulate_history_rewind once the hero is back; this is only the fallback.
+static const std::map<uint, double> s_server_wait_timeouts = {
+	{ 0xCD396790, 0.1 },
+	{ 0x7211CF70, 2.0 },
+};
+static std::map<std::pair<StatescriptInstance*, int>, double> s_server_wait_started{};
+
+static uint state_node_type(StatescriptInstance* inst, int idx) {
+	if (!inst->graph || idx < 0 || idx >= inst->graph->m_nodes.count())
+		return 0;
+	return inst->graph->m_nodes.list()[idx]->graph_node.base.vfptr->GetSTUInfo()->Hash;
+}
+
+static void finish_server_wait_states(Component_23_Statescript* ss) {
+	double now = GetGameRuntimeSecs();
+	std::set<std::pair<StatescriptInstance*, int>> running{};
+	std::vector<std::pair<StatescriptInstance*, int>> to_finish{};
+	for (auto inst : ss->ss_inner) {
+		for (auto& [idx, state] : statescript_logger::GetScriptState(inst)) {
+			if (state.is_finish_state)
+				continue;
+			auto timeout = s_server_wait_timeouts.find(state_node_type(inst, idx));
+			if (timeout == s_server_wait_timeouts.end())
+				continue;
+			auto key = std::make_pair(inst, idx);
+			running.insert(key);
+			double& started = s_server_wait_started.try_emplace(key, now).first->second;
+			if (now - started > timeout->second) {
+				to_finish.push_back(key);
+				started = now; //Retry later instead of every frame if finishing does not take
+			}
+		}
+	}
+	std::erase_if(s_server_wait_started, [&](const auto& item) { return !running.contains(item.first); });
+
+	//Outside the loop above: finishing a state starts others, which adds entries to the logger's map.
+	for (auto& [inst, idx] : to_finish) {
+		LOG_CORE(Info, "[TRACE] server-wait finished: script {:X} inst {} node <{}> type {:08X}\n", inst->script_id, inst->instance_id, idx, state_node_type(inst, idx));
+		inst->StartStopState(idx, false);
+	}
+}
+
+//Debug trace for offline analysis: logs every state start/stop in the local hero's scripts.
+static std::map<std::pair<StatescriptInstance*, int>, bool> s_traced_states{};
+
+static void trace_state_changes(Component_23_Statescript* ss) {
+	static double budget_window = 0;
+	static int budget = 0;
+	double now = GetGameRuntimeSecs();
+	if (now - budget_window > 1.0) {
+		budget_window = now;
+		budget = 200; //Lines per second, so a flickering state can't flood the log
+	}
+	for (auto inst : ss->ss_inner) {
+		for (auto& [idx, state] : statescript_logger::GetScriptState(inst)) {
+			bool running = !state.is_finish_state;
+			auto [it, inserted] = s_traced_states.try_emplace(std::make_pair(inst, idx), !running);
+			if (it->second == running)
+				continue;
+			it->second = running;
+			if (budget-- > 0) {
+				LOG_CORE(Info, "[TRACE] state {}: script {:X} inst {} node <{}> type {:08X}\n",
+					running ? "start" : "end", inst->script_id, inst->instance_id, idx, state_node_type(inst, idx));
+			}
+		}
+	}
+}
+
+//Debug trace: logs logical button presses with their in-game names.
+static void trace_logical_buttons(Component_50_Input* input) {
+	static char previous[0xC3]{};
+	char* current = input->tick10 ? input->stru1.tick0 : input->stru1.tick1;
+	for (int i = 0; i < 0xC3; i++) {
+		if (current[i] != previous[i]) {
+			auto name = LogicalButtonById(i);
+			LOG_CORE(Info, "[TRACE] button {}: {} ({})\n", current[i] ? "down" : "up", i, name && name->name ? name->name : "?");
+		}
+	}
+	memcpy(previous, current, sizeof(previous));
+}
+
+//Tracer's Recall (STUStatescriptStateHistoryRewinder) only plays its effects client-side; moving the player
+//back is done by the server. Emulate it: keep a short position history of the local hero and, while a
+//HistoryRewinder state runs, walk the hero back through it like the real ability does.
+static constexpr uint STATE_HISTORY_REWINDER = 0x7211CF70;
+static constexpr double REWIND_HISTORY_SECS = 3.0;   //Recall's rewinder is configured with 3.0 s of history
+static constexpr double REWIND_DURATION_SECS = 1.25; //How long the real Recall takes to play back
+static constexpr double REWIND_BLEND_IN_SECS = 0.1;  //The rewinder's 0.1 s setting
+static constexpr double REWIND_BLEND_OUT_SECS = 0.2; //Tuned in game: 0.1 s felt like a hard stop, 0.3 s like being held
+
+//Fraction of the history played back after `elapsed` seconds: accelerate over the blend in, constant
+//speed, decelerate over the blend out (trapezoidal velocity), reaching 1 at REWIND_DURATION_SECS.
+static double rewind_progress(double elapsed) {
+	constexpr double T = REWIND_DURATION_SECS, a = REWIND_BLEND_IN_SECS, b = REWIND_BLEND_OUT_SECS;
+	constexpr double v = 1.0 / (T - a / 2 - b / 2); //Peak speed so the area under the trapezoid is 1
+	if (elapsed <= 0)
+		return 0;
+	if (elapsed >= T)
+		return 1;
+	if (elapsed < a)
+		return v * elapsed * elapsed / (2 * a);
+	if (elapsed > T - b)
+		return 1 - v * (T - elapsed) * (T - elapsed) / (2 * b);
+	return v * (elapsed - a / 2);
+}
+struct PositionSample {
+	double time;
+	Vector4 position;
+	int movement_flags; //Grounded/jumping/falling, restored on arrival so the mover doesn't think it's mid-air
+	int ticks_in_air;
+};
+static std::deque<PositionSample> s_position_history{};
+static uint s_position_history_entity = 0;
+static double s_rewind_started = -1; //Negative while no rewind is running
+static double s_landing_trace_until = -1;
+
+//The hero's current MovementState inside STUCharacterMoverComponent (0x15). Its absolute_position (+0x220)
+//is the 0xC70 offset the arrow-key teleport writes.
+static MovementState* hero_movement_state(Entity* model) {
+	auto comp = model->getById<__int64>(0x15);
+	return comp ? (MovementState*)((__int64)comp + 0xA50) : nullptr;
+}
+
+//Recall drops the hero in place, so don't carry over momentum from before or during the rewind.
+static void clear_momentum(MovementState* state) {
+	state->position_delta = Vector4(0, 0, 0, 0);
+	state->gravity_delta = Vector4(0, 0, 0, 0);
+}
+
+//The running HistoryRewinder state, or { nullptr, -1 }.
+static std::pair<StatescriptInstance*, int> find_history_rewinder(Component_23_Statescript* ss) {
+	for (auto inst : ss->ss_inner) {
+		for (auto& [idx, state] : statescript_logger::GetScriptState(inst)) {
+			if (!state.is_finish_state && state_node_type(inst, idx) == STATE_HISTORY_REWINDER)
+				return { inst, idx };
+		}
+	}
+	return { nullptr, -1 };
+}
+
+//Interpolated position at a point in time, clamped to the recorded range.
+static Vector4 history_position_at(double time) {
+	if (time <= s_position_history.front().time)
+		return s_position_history.front().position;
+	for (size_t i = 1; i < s_position_history.size(); i++) {
+		auto& a = s_position_history[i - 1];
+		auto& b = s_position_history[i];
+		if (b.time < time)
+			continue;
+		float t = b.time > a.time ? (float)((time - a.time) / (b.time - a.time)) : 1.f;
+		return Vector4(a.position.X + (b.position.X - a.position.X) * t,
+			a.position.Y + (b.position.Y - a.position.Y) * t,
+			a.position.Z + (b.position.Z - a.position.Z) * t,
+			a.position.W);
+	}
+	return s_position_history.back().position;
+}
+
+//Recorded sample closest to a point in time.
+static const PositionSample& history_sample_at(double time) {
+	const PositionSample* best = &s_position_history.front();
+	for (auto& sample : s_position_history) {
+		if (std::abs(sample.time - time) < std::abs(best->time - time))
+			best = &sample;
+	}
+	return *best;
+}
+
+static void emulate_history_rewind(Entity* model, Component_23_Statescript* ss) {
+	auto movement = hero_movement_state(model);
+	if (!movement)
+		return;
+	auto position = &movement->absolute_position;
+	if (s_position_history_entity != model->entity_id) {
+		s_position_history.clear();
+		s_position_history_entity = model->entity_id;
+		s_rewind_started = -1;
+	}
+	double now = GetGameRuntimeSecs();
+
+	auto [rewinder_inst, rewinder_idx] = find_history_rewinder(ss);
+	if (rewinder_inst) {
+		if (s_position_history.empty())
+			return;
+		if (s_rewind_started < 0) {
+			s_rewind_started = now;
+			auto target = history_position_at(now - REWIND_HISTORY_SECS);
+			LOG_CORE(Info, "[TRACE] rewind start: from ({:.2f} {:.2f} {:.2f}) to ({:.2f} {:.2f} {:.2f})\n",
+				position->X, position->Y, position->Z, target.X, target.Y, target.Z);
+			LOG_CORE(Info, "[TRACE] momentum at rewind start: position_delta ({:.3f} {:.3f} {:.3f}) gravity_delta ({:.3f} {:.3f} {:.3f})\n",
+				movement->position_delta.X, movement->position_delta.Y, movement->position_delta.Z,
+				movement->gravity_delta.X, movement->gravity_delta.Y, movement->gravity_delta.Z);
+		}
+		double progress = rewind_progress(now - s_rewind_started);
+		*position = history_position_at(s_rewind_started - progress * REWIND_HISTORY_SECS);
+		clear_momentum(movement);
+		if (progress >= 1.0) {
+			//Back where we were: end the rewind like the server would, releasing its movement/ability locks.
+			rewinder_inst->StartStopState(rewinder_idx, false);
+		}
+		return; //Don't record the rewind itself
+	}
+
+	if (s_rewind_started >= 0) {
+		if (!s_position_history.empty()) {
+			double target_time = s_rewind_started - REWIND_HISTORY_SECS;
+			auto& target = history_sample_at(target_time);
+			LOG_CORE(Info, "[TRACE] rewind landing: flags {:#x} -> {:#x}, ticks_in_air {} -> 0 (was {} at the target)\n",
+				movement->movement_flags, target.movement_flags, movement->ticks_in_air, target.ticks_in_air);
+			*position = history_position_at(target_time);
+			movement->movement_flags = target.movement_flags;
+			//Momentum is cleared, so an airborne arrival should start falling from rest. Keeping the recorded
+			//ticks_in_air made it drop as if it had already been falling for a while.
+			movement->ticks_in_air = 0;
+		}
+		clear_momentum(movement);
+		LOG_CORE(Info, "[TRACE] rewind end: at ({:.2f} {:.2f} {:.2f})\n", position->X, position->Y, position->Z);
+		s_rewind_started = -1;
+		s_position_history.clear();
+		s_landing_trace_until = now + 0.5;
+	}
+	if (now < s_landing_trace_until) {
+		LOG_CORE(Info, "[TRACE] after landing: y {:.3f} flags {:#x} ticks_in_air {}\n",
+			position->Y, movement->movement_flags, movement->ticks_in_air);
+	}
+
+	s_position_history.push_back({ now, *position, movement->movement_flags, movement->ticks_in_air });
+	while (!s_position_history.empty() && s_position_history.front().time < now - REWIND_HISTORY_SECS - 1.0)
+		s_position_history.pop_front();
+}
+
 void PrometheusSystem::OnTick(float tick) {
 	Entity* local_controller = _game_ea->getLocalEnt();
 	Entity* local_model = nullptr;
@@ -697,6 +936,10 @@ void PrometheusSystem::OnTick(float tick) {
 				alive.type = StatescriptPrimitive_BYTE;
 				alive.value = 1;
 				ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0xd8000000000094c }, alive);
+
+				trace_state_changes(ss);
+				finish_server_wait_states(ss);
+				emulate_history_rewind(local_model, ss);
 			}
 		}
 	}
@@ -970,7 +1213,10 @@ void PrometheusSystem::OnTick(float tick) {
 	if (!_input_component) {
 		_input_component = LobbyEntityAdmin()->getSingletonComponent<Component_50_Input>(0x50);
 	}
-	else {
+	if (_input_component) {
+		trace_logical_buttons(_input_component);
+	}
+	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/
 
