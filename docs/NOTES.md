@@ -277,3 +277,26 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   them from a bitstream.
 - Tracing with `auto_test` `started` (every state an ability press starts, with node types) showed the volleys
   starting and finishing within a tick; graph dump node indexes are not runtime state indexes (`idx_in_m_states`).
+
+## Ultimates (still blocked, 2026-10-18)
+
+- Auto Test `ultprobe` sets each integer entity variable at 0 to 100, waits 1.5 s (its own effects become noise),
+  then presses ability_3. No variable makes any ultimate start (Tracer, Pharah, D.Va). An earlier version set the
+  variable and pressed in the same tick: `0xD800000000001DE` = 100 then caused 22 state changes, but those are the
+  variable's own effects (likely "ultimate ready" feedback), not the ultimate. D.Va's "ok" for ability_3 in normal
+  runs is one background change, not her ultimate.
+- Writing `0x1DE` continuously made other abilities look dead in Auto Test (constant churn learned as noise).
+- Next: the gate is in `STUStatescriptStateAbility` (runtime classes: vtable `0x15D81B0` from factory `0x1085520`,
+  derived `0x15D7C98` from `0xD61F60`); find what its start check reads for ultimates.
+- Auto Test `PROMETHEUS_DUMP_VARS` adds the hero's entity variables (id, type, value) to the report.
+
+## Projectiles through walls (open)
+
+- The user sees many projectiles pass through floors and walls. Measured with Auto Test `pitch=80` (aim at the
+  floor) and entity lifetimes: Pharah's rocket, Concussive Blast and Junkrat's mine die within ~0.05 s (they hit
+  the floor), with or without the authoritative registration (`0xD35C20`, callbacks vfunc 1). Which projectiles go
+  through is not known yet.
+- Projectile entities (e.g. Pharah's rocket: components `1 3 4 27 40 7A`) have no statescript component, so the
+  impact is the projectile component's job, not a script. The spawner path (type 1) also sets filter bit
+  `0x800000` on component `0x10` (`0xCD0B00`), but these projectiles have no component `0x10`.
+- `0xD45240` clears projectile component `+0xE2A` after every creation (it is not the "predicted" difference).

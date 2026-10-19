@@ -2,6 +2,7 @@
 #include "heroes.h"
 #include "game.h"
 #include "Statescript.h"
+#include "StatescriptVar.h"
 #include "STU_Editable.h"
 #include "player_spawner.h"
 #include "quick_play.h"
@@ -28,6 +29,10 @@ namespace auto_test {
 		Press,       //Hold the button
 		Observe,     //Button released, still counting reactions
 		Wait,        //Ability pressed: wait for it to finish before checking what is left running
+		UltGap,      //"ultprobe": pause between tries
+		UltSettle,   //"ultprobe": variable set, learning its own effects as noise
+		UltPress,    //"ultprobe": a variable set to 100, hold ability_3
+		UltObserve,  //"ultprobe": count the reactions
 		Exiting,     //Report written; give the log a moment to flush before closing the game
 		Done,
 	};
@@ -379,6 +384,36 @@ namespace auto_test {
 		LOG_CORE(Info, "[AUTOTEST] wrote entities_dump.json ({} entities)\n", out.size());
 	}
 
+	//Debug: with PROMETHEUS_DUMP_VARS set, the hero's entity variables (identifier -> type and value) go into the report
+	//("vars"), e.g. to find the ultimate charge. A variable's primitive value is at +0xa0 (StatescriptVar_Primitive);
+	//for other kinds (dictionaries, nested varbags) the type comes out as something outside 1..11.
+	static nlohmann::json varbag_json(StatescriptVar_VarBag* bag) {
+		nlohmann::json out = nlohmann::json::object();
+		if (!bag)
+			return out;
+		for (auto& bucket : bag->sub_items) {
+			for (int i = 0; i < bucket.item_count && bucket.arr_ptr; i++) {
+				auto& item = bucket.arr_ptr[i];
+				if (!item.ptr)
+					continue;
+				auto& value = ((StatescriptVar_Primitive*)item.ptr)->global_var;
+				auto key = std::format("{:X}", item.rid_id);
+				if (value.type >= StatescriptPrimitive_BYTE && value.type < StatescriptPrimitive_COUNT)
+					out[key] = { { "type", (int)value.type }, { "value", value.get_value_str() } };
+				else
+					out[key] = "other";
+			}
+		}
+		return out;
+	}
+
+	static void dump_hero_vars() {
+		auto env = getenv("PROMETHEUS_DUMP_VARS");
+		auto ss = local_hero_statescript();
+		if (env && *env && ss)
+			s_hero_report["vars"] = varbag_json(ss->ss_inner.rid_entity_varbag);
+	}
+
 	//Debug: with PROMETHEUS_DUMP_MAP_ENTITIES set, every entity of the loaded map goes to Prometheus/map_entities.json
 	//(components with their data type, position), e.g. to find the spawn rooms.
 	static void dump_map_entities() {
@@ -620,6 +655,68 @@ namespace auto_test {
 			set_step(Step::Gap);
 	}
 
+	//"ultprobe": instead of the normal presses, look for the ultimate charge. Press ability_3 once as is, then once per
+	//integer entity variable that is 0 with that variable set to 100; a try with reactions names the charge variable.
+	static std::vector<__int64> s_ult_candidates{};
+	static size_t s_ult_try = 0; //0: nothing set; n: s_ult_candidates[n - 1] set to 100
+	static nlohmann::json s_ult_results{};
+
+	static void set_entity_var(__int64 id, int value) {
+		auto ss = local_hero_statescript();
+		if (ss && ss->ss_inner.rid_entity_varbag)
+			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, id }, StatescriptPrimitive(value, StatescriptPrimitive_INT));
+	}
+
+	static std::set<StateKey> s_ult_baseline_noise{};
+	static constexpr double ULT_SETTLE_SECS = 1.5; //After setting the variable: what changes now is its effect, not the press
+
+	//Sets the try's variable, then lets its own effects (e.g. "ultimate ready" sounds) play out as noise.
+	static void begin_ult_try() {
+		s_noise = s_ult_baseline_noise;
+		if (s_ult_try > 0)
+			set_entity_var(s_ult_candidates[s_ult_try - 1], 100);
+		set_step(Step::UltSettle);
+	}
+
+	static void press_ult() {
+		s_started.clear();
+		s_reactions = 0;
+		s_press_event_sent = false;
+		s_press_started = GetGameRuntimeSecs();
+		set_step(Step::UltPress);
+	}
+
+	static void start_ult_probe() {
+		s_ult_candidates.clear();
+		s_ult_try = 0;
+		s_ult_results = nlohmann::json::array();
+		s_ult_baseline_noise = s_noise;
+		auto ss = local_hero_statescript();
+		auto vars = varbag_json(ss ? ss->ss_inner.rid_entity_varbag : nullptr);
+		for (auto& [key, var] : vars.items()) {
+			if (var.is_object() && var["type"] == (int)StatescriptPrimitive_INT && var["value"] == "0")
+				s_ult_candidates.push_back(std::stoll(key, nullptr, 16));
+		}
+		LOG_CORE(Info, "[AUTOTEST] {}: ultimate probe, {} candidate variables\n", s_heroes[s_hero].name, s_ult_candidates.size());
+		begin_ult_try();
+	}
+
+	static void finish_ult_try() {
+		auto var = s_ult_try > 0 ? std::format("{:X}", s_ult_candidates[s_ult_try - 1]) : std::string("none");
+		s_ult_results.push_back({ { "var", var }, { "reactions", s_reactions } });
+		if (s_reactions > 0)
+			LOG_CORE(Info, "[AUTOTEST] {}: ultimate reacts with {} = 100 ({} state changes)\n", s_heroes[s_hero].name, var, s_reactions);
+		if (s_ult_try > 0)
+			set_entity_var(s_ult_candidates[s_ult_try - 1], 0);
+		s_ult_try++;
+		if (s_ult_try > s_ult_candidates.size()) {
+			s_hero_report["ult_probe"] = s_ult_results;
+			finish_hero();
+		}
+		else
+			set_step(Step::UltGap);
+	}
+
 	//Map whose path contains `wanted` (playable maps before login scenes), 0 if none.
 	static __int64 find_map(const std::string& wanted) {
 		__int64 found = 0;
@@ -782,13 +879,46 @@ namespace auto_test {
 				//so only record it (pressing hero_select does not close it).
 				s_hero_report["hero_select_open"] = hero_select_active();
 				s_hero_report["background_states"] = s_noise.size();
+				dump_hero_vars();
 				if (s_hero == 0) {
 					dump_requested_stus(); //Again, now that the map and the first hero are loaded
 					dump_map_entities();
 				}
 				LOG_CORE(Info, "[AUTOTEST] {}: {} states change on their own\n", s_heroes[s_hero].name, s_noise.size());
-				start_press();
+				if (s_options.find("ultprobe") != std::string::npos)
+					start_ult_probe();
+				else
+					start_press();
 			}
+			break;
+		case Step::UltGap:
+			track_states(Track::Follow);
+			if (step_elapsed() > GAP_SECS)
+				begin_ult_try();
+			break;
+		case Step::UltSettle:
+			track_states(Track::LearnNoise);
+			if (step_elapsed() > ULT_SETTLE_SECS)
+				press_ult();
+			break;
+		case Step::UltPress:
+			if (!s_press_event_sent) {
+				send_button_event("ability_3", true);
+				s_press_event_sent = true;
+			}
+			set_button(input, "ability_3", true);
+			track_states(Track::Count);
+			if (step_elapsed() > PRESS_SECS) {
+				set_button(input, "ability_3", false);
+				send_button_event("ability_3", false);
+				set_step(Step::UltObserve);
+			}
+			break;
+		case Step::UltObserve:
+			set_button(input, "ability_3", false);
+			track_states(Track::Count);
+			if (GetGameRuntimeSecs() - s_press_started > REACTION_SECS)
+				finish_ult_try();
 			break;
 		case Step::Gap:
 			track_states(Track::Follow);
