@@ -797,6 +797,8 @@ static __int64 __fastcall create_projectile_hook(__int64* callbacks, void* shot,
 		*type = 1;
 	if (!projectile)
 		LOG_CORE(Info, "[TRACE] projectile not created: result {}\n", *result);
+	else
+		server_nodes::projectile_created((Entity*)projectile);
 	return projectile;
 }
 

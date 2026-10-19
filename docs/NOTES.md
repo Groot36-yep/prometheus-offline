@@ -364,9 +364,16 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   it then sets var `0x26` (the possessed tire) from var `0x28` and switches the graph to driving (switch var
   `0x6C7` = 2). Emulated as a "server reply" a tick after node 32 created the tire: var `0x28` = tire, deliver
   `0x13E`. Without it the graph returned to ready after 1.5 s, which clears var `0x26` and ends possession.
-- RIP-Tire ends when the server explodes it; offline it never would. Removing the tire on primary fire or after
-  10 s ends the possession and the graph returns to normal (no explosion). The tire has no camera of its own (the
-  server's view is third person), so the camera stays with Junkrat.
+- RIP-Tire: with the authority and clocks below, the tire's own script (`0x233`) does what the server did: it stays
+  attached to Junkrat (StateAttach node 88, invisible) until its 2 s wait (node 80) sets var `0x2BB`, then runs its
+  third-person camera (Camera3P node 10), movement mods and the detonate buttons (nodes 28/29/71: var `0x7E0`),
+  explodes (effect node 24, damage TrackTargets 59/69) and destroys itself 2 s later. Removing it ends the
+  possession. Fallback if it is still there: removed 3 s after primary fire or after 15 s. The camera follows the
+  tire (cam_attach); with the camera state not running the view had been inside the tire.
+- RIP-Tire's position var (`0x6BC`) stays empty when placing finds no valid spot (looking at the sky, in the air):
+  the tire was created at the map origin. A variable position still at the origin now falls back to the hero.
+- Ending a possession gives control back only if the controller still drives the possessed entity; after a hero
+  switch it had put the new hero's controls back on the old one.
 - Debug: `PROMETHEUS_TRACE_LINKS=<script id>` logs every link that script follows (`[LINK]` lines).
 - Mei's Ice Wall: "place now" inputs (type `8DCB62EA`) chain: StateFindGround (input `C63FD388`, answer `02701BF5`,
   valid byte `+0xc8`) -> wall start `12AA4F0F` (input `5556C513`, answer `8CF01B33`) -> five segments `614C3A0A`
@@ -390,5 +397,37 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
 - Safety: `get_argument_object`/`get_argument_primitive` crash on a field the type lacks; `field_object` looks
   fields up by hash first. The game's GetEntityPos crashed for an entity value; positions are read from
   component 1 instead.
-- Open (2026-10-19): not yet confirmed in game that turrets shoot, the tire drives, dragons and pillars appear; the
-  RIP-Tire explosion; Zarya's Graviton vortex.
+- Authority over created entities (2026-10-19). Offline this client is the server for the entities it creates,
+  but the client treats their scripts like any server entity's:
+  1. Server-only nodes (`+0x76`) are refused by the run-node check (`0xD739A0`, instance vfunc `0x88`). The tire's
+     release, camera and detonation, the dragons' flight (ChaseVar 27), the pillars' and turrets' server logic are
+     such nodes. `entity_runs_node_hook` runs every node for scripts on created entities. A node type without client
+     implementation is harmless: actions continue through their out plugs, states get the base state (`0xF4E230`).
+  2. Every update recomputes instance flag bit 22 (`0xD73EF0`, slot 39) from vfunc `0x190` (`0xD73BE0`): set unless
+     the script has authority (bit 3) on an entity the player does not control. The node check (`0x88`) and the state
+     end/change checks (`0x170` = `0xD73E90`, `0x178` = `0xD73DF0`) need it, so scripts loaded with authority lost it at
+     their first update and no state could end (timers fired, `0xF4A9C0` refused the end).
+     `entity_locally_controlled_hook` answers yes for created entities.
+  3. A statescript component's clock (sync manager `+0x2c4` frame, `+0x2d0`/`+0x2d8` time in ms, `+0x360` ms per
+     frame) advances in its update (sync manager vfunc slot 9 = `0xD13C20` -> `0xF44EF0(frame, frames)`), which also
+     runs timers (`0xF45230`, instances with flags `& 0x8014 == 0x8000`) and timed states. The game ran it for created
+     entities on their first frame or two only, so their clocks stopped: no wait ended (the dragon stayed 4 min).
+     `run_clocks` advances each by the frames the local hero's clock advanced. Frame counts are per hero: a new hero
+     restarts at ~1000 and the game sets existing clocks back with it; `run_clocks` keeps them from going back.
+  The script's own entity: `inst->ss_inner` is the sync manager embedded in Component_23 at `+0xC0`, whose
+  `entity_backref` is the entity. Instance vfunc `0x1C8` gives the script's owner instead (Junkrat's controller for
+  the tire's script).
+- Hanzo's Dragonstrike: the dragon entity (`0x2BA`) is created at the origin on purpose; its script (`0x132`) moves
+  var (`0x4`, `0x1B0`) from the arrow's start (`0x497`) along its direction (`0x1B1`) with ChaseVar 27 (server-only)
+  and parents the dragon cosmetics (CosmeticEntity 31/32, `0x237`/`0x239`) to it. Verified moving ~8.4 m/s.
+- Mei's Blizzard: the drone (projectile entity `0x946`, script `0x65E`) deploys on server message
+  `0x24000000000059D` (sent once it landed): MoveTo 2 m up, 5 s storm (TrackTargets/ModifyHealth/freeze aura,
+  effects), end effect, destroy. Offline the projectile system removed the drone on impact (0.76 s after the throw)
+  and nothing deployed. `server_nodes::projectile_created` (called from `create_projectile_hook`) follows such
+  projectiles; when one is removed, the same entity is placed at its last position (with authority) and the message
+  delivered. STUStatescriptStateMoveTo (`C1035274`, `m_destinationPos` evaluated once at start, `m_speed`) is
+  emulated for created entities by moving their component 1 position and ending the state on arrival.
+- Debug: `PROMETHEUS_WATCH_VARS=<script>:<var>,...` (hex, `4.1B0` for a two-step path) logs those variables and the
+  instance's clock, flags and queue head for that script on created entities twice a second (`[VARS]`).
+- Open (2026-10-19): confirm in game: the tire's chase camera and steering, the dragons' look, Mei's storm, turrets
+  shooting (no enemies offline to shoot at); Zarya's Graviton vortex.

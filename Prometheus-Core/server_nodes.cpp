@@ -3,6 +3,7 @@
 #include "Statescript.h"
 #include "StatescriptVar.h"
 #include "STUConfigVar_Custom.h"
+#include "STUConfigVarDynamic_Custom.h"
 #include "STU_Editable.h"
 #include "game.h"
 #include "Logs/Logs.h"
@@ -24,7 +25,7 @@ namespace server_nodes {
 	static constexpr __int64 RVA_FIND_NODE_IMPL = 0xF433A0;
 	static constexpr int INSTANCE_FLAGS = 0x258;
 	static constexpr int INSTANCE_RUNS_NODE_VFUNC = 0x88 / 8;
-	static constexpr int INSTANCE_OWNER_VFUNC = 0x1C8 / 8;
+	static constexpr int STATESCRIPT_SYNC_MGR = 0xC0; //Embedded in the statescript component (Component_23_Statescript)
 	//Instance vfunc 0x88 (0xD739A0 for entity scripts) runs a node only if it is not server-only and the instance has
 	//this flag (or the node is client-only). The hero's scripts have it (0x400081); scripts on entities the server
 	//created for us do not (Torbjorn's turret 0, Hanzo's dragon 0x208009), so they refused nearly every node.
@@ -173,10 +174,12 @@ namespace server_nodes {
 		return q;
 	}
 
+	//The entity whose statescript component runs the instance (instance vfunc 0x1C8 gives its owner instead, e.g.
+	//Junkrat's controller for the RIP-Tire's script).
 	static Entity* script_entity(StatescriptInstance* inst) {
-		int id = 0;
-		((int*(__fastcall*)(StatescriptInstance*, int*))((__int64*)inst->vfptr)[INSTANCE_OWNER_VFUNC])(inst, &id);
-		return id ? GameEntityAdmin()->getEntById(id) : nullptr;
+		auto mgr = inst ? inst->ss_inner : nullptr;
+		auto component = mgr ? (ComponentBase*)((char*)mgr - STATESCRIPT_SYNC_MGR) : nullptr;
+		return component && component->component_id == 0x23 ? component->entity_backref : nullptr;
 	}
 
 	static uint32_t s_possession_hero(); //The hero while it possesses another entity (defined with possession below)
@@ -202,9 +205,73 @@ namespace server_nodes {
 					run_shared_nodes(inst);
 	}
 
+	//Offline this client is also the server for the entities it creates, so their scripts run their server-only nodes
+	//(+0x76) too: the RIP-Tire's release from Junkrat, its camera, movement and detonation, the dragons' flight
+	//(ChaseVar), the pillars' and turrets' server logic. The run-node check of entity scripts (instance vfunc 0x88,
+	//0xD739A0) refuses those on a client. A node type the client has no implementation for does nothing harmful: an
+	//action continues through its out plugs, a state gets the base state (0xF4E230).
+	static constexpr __int64 RVA_ENTITY_RUNS_NODE = 0xD739A0;
+	using EntityRunsNodeFn = __int64(__fastcall*)(StatescriptInstance* inst, STUStatescriptBase* node);
+	static EntityRunsNodeFn s_entity_runs_node_orig = nullptr;
+
+	static bool is_created(StatescriptInstance* inst) {
+		auto ent = s_created.empty() ? nullptr : script_entity(inst);
+		return ent && s_created.count(ent->entity_id);
+	}
+
+	static __int64 __fastcall entity_runs_node_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
+		return is_created(inst) ? 1 : s_entity_runs_node_orig(inst, node);
+	}
+
+	//Every update recomputes instance flag bit 22 from instance vfunc 0x190 (0xD73BE0): set unless the script has
+	//authority (bit 3) on an entity the local player does not control. The checks for running a node (0x88) and for
+	//ending or changing a state (0x170, 0xD73E90; 0x178) need it, so scripts started with authority on created
+	//entities lost it at their first update and no state of theirs could end (the RIP-Tire's wait for its release
+	//fired and was refused). Created entities count as locally controlled.
+	static constexpr __int64 RVA_ENTITY_LOCALLY_CONTROLLED = 0xD73BE0;
+	using EntityLocallyControlledFn = __int64(__fastcall*)(StatescriptInstance* inst);
+	static EntityLocallyControlledFn s_entity_locally_controlled_orig = nullptr;
+
+	static __int64 __fastcall entity_locally_controlled_hook(StatescriptInstance* inst) {
+		return is_created(inst) ? 1 : s_entity_locally_controlled_orig(inst);
+	}
+
 	//STUStatescriptActionCreateEntity (0E3689F3) names its fields differently: m_entityDef, m_out_Entity, and
 	//2108984C, a random yaw range in degrees (m_min, m_max; Mei's wall pillars: 0-359). Its owner is the script's.
 	static constexpr unsigned FIELD_RANDOM_YAW = 0x2108984C;
+
+	//Spawns an entity definition as the server would for its owner: owned by it (GetOwner in the new entity's scripts),
+	//on the team of the hero, its scripts run here with the server's authority.
+	static Entity* spawn(__int64 def, __int64 res, Vector3 position, Vector4 rotation, Entity* owner, Entity* hero) {
+		auto loader = EntityLoader::Create(def, res, false, false);
+		if (!loader) {
+			LOG_CORE(Warn, "[NODES] create entity: no loader for {:X}\n", def);
+			return nullptr;
+		}
+		auto init = new Component_1_SceneRendering::InitData{};
+		init->position = Vector4(position.X, position.Y, position.Z, 0);
+		init->rotation = rotation;
+		init->scale = Vector4(1, 1, 1, 1);
+		loader->loader_entries[1].init_data = (__int64)init;
+		auto ent = loader->Spawn(GameEntityAdmin());
+		delete init;
+		if (!ent) {
+			LOG_CORE(Warn, "[NODES] create entity: spawning {:X} failed\n", def);
+			return nullptr;
+		}
+		if (auto backref = ent->getById<Component_1F_Backref>(0x1F); backref && owner) {
+			backref->backref_entid = owner->entity_id;
+			backref->backref_global_entid = owner->entity_global_id;
+		}
+		auto hero_filter = hero ? hero->getById<Component_10_FilterBits>(0x10) : nullptr; //The hero's, not its controller's
+		if (auto filter = ent->getById<Component_10_FilterBits>(0x10); filter && hero_filter) {
+			filter->filter_bits = hero_filter->filter_bits;
+			filter->FilterBitsMakeFinal();
+		}
+		s_created.insert(ent->entity_id);
+		run_shared_nodes(ent);
+		return ent;
+	}
 
 	//Spawns the entity a creation node (1BB99C36, 0E3689F3) or pet state (4CCED352) describes.
 	static Entity* spawn_from_node(StatescriptInstance* inst, STUStatescriptBase* stu) {
@@ -226,10 +293,20 @@ namespace server_nodes {
 		if (!owner && !field_object(node, FIELD_OWNER).valid())
 			owner = self;
 		auto hero = hero_of(owner ? owner : self);
+		if (self && !(hero && hero->getById<Component_1_SceneRendering>(1)))
+			hero = self; //The owner controls no hero (any more)
 		auto hero_scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
 		Vector3 position = hero_scene ? Vector3(hero_scene->position.X, hero_scene->position.Y, hero_scene->position.Z) : Vector3();
-		if (eval(inst, node, "m_position", position_value)) //Without one (pets), at the hero
-			position = to_vec3(position_value);
+		//Without a position (pets), at the hero. A constant is used as is (Hanzo's dragon: the origin, its script moves
+		//its parts); a variable still at the origin was never filled, and the server falls back to the hero (RIP-Tire:
+		//the placement found no valid spot, so its position var 0x6BC stayed empty)
+		auto position_field = field_object(node, "m_position").get_runtime_root();
+		bool constant = position_field.valid() && position_field.struct_info->Hash == stringHash("STUConfigVarVec3");
+		if (eval(inst, node, "m_position", position_value)) {
+			auto p = to_vec3(position_value);
+			if (constant || p.X != 0 || p.Y != 0 || p.Z != 0)
+				position = p;
+		}
 		Vector3 forward = eval(inst, node, FIELD_FORWARD, forward_value) ? to_vec3(forward_value) : Vector3();
 		Vector3 up = eval(inst, node, FIELD_UP, up_value) ? to_vec3(up_value) : Vector3();
 
@@ -246,36 +323,9 @@ namespace server_nodes {
 		else if (hero_scene && !position_value.type)
 			rotation = hero_scene->rotation;
 
-		auto loader = EntityLoader::Create(def, res, false, false);
-		if (!loader) {
-			LOG_CORE(Warn, "[NODES] create entity: no loader for {:X}\n", def);
+		auto ent = spawn(def, res, position, rotation, owner, hero);
+		if (!ent)
 			return nullptr;
-		}
-		auto init = new Component_1_SceneRendering::InitData{};
-		init->position = Vector4(position.X, position.Y, position.Z, 0);
-		init->rotation = rotation;
-		init->scale = Vector4(1, 1, 1, 1);
-		loader->loader_entries[1].init_data = (__int64)init;
-		auto ent = loader->Spawn(GameEntityAdmin());
-		delete init;
-		if (!ent) {
-			LOG_CORE(Warn, "[NODES] create entity: spawning {:X} failed\n", def);
-			return nullptr;
-		}
-
-		//Owned by the owner (GetOwner in the new entity's scripts), on the team of the entity that created it
-		if (auto backref = ent->getById<Component_1F_Backref>(0x1F); backref && owner) {
-			backref->backref_entid = owner->entity_id;
-			backref->backref_global_entid = owner->entity_global_id;
-		}
-		auto self_filter = hero ? hero->getById<Component_10_FilterBits>(0x10) : nullptr; //The hero's, not its controller's
-		if (auto filter = ent->getById<Component_10_FilterBits>(0x10); filter && self_filter) {
-			filter->filter_bits = self_filter->filter_bits;
-			filter->FilterBitsMakeFinal();
-		}
-
-		s_created.insert(ent->entity_id);
-		run_shared_nodes(ent);
 		auto out = field_object(node, FIELD_OUT_ENTITY);
 		if (!out.valid())
 			out = field_object(node, "m_out_Entity");
@@ -324,6 +374,94 @@ namespace server_nodes {
 			}
 		}
 		return delivered;
+	}
+
+	//
+	// Landing projectiles: Mei's Blizzard drone (entity 400000000000946, script 0x65E) is a projectile whose script waits
+	// for the server's message 0x24000000000059D, sent when the drone has landed: it then deploys the storm (a 5 s
+	// freeze aura and its effects at the drone) and removes the drone. Offline the projectile system removes the drone
+	// when it hits the ground and nobody sends the message, so the drone vanished into the floor. Follow such
+	// projectiles; when one is removed, place the same entity where it was last and deliver the message to it.
+	//
+	struct LandingProjectile {
+		__int64 script;     //Script that identifies the projectile entity
+		__int64 entity_def; //Entity placed where it lands
+		__int64 message;    //Message the server sends it once it has landed
+	};
+	static constexpr LandingProjectile LANDING_PROJECTILES[] = {
+		{ 0x58000000000065E, 0x400000000000946, 0x24000000000059D }, //Mei's Blizzard drone
+	};
+	static constexpr int MESSAGE_TRIES = 60; //Ticks to wait for the placed entity's graph (built lazily)
+
+	struct Flying {
+		const LandingProjectile* kind;
+		uint32_t owner;
+		Vector3 position;
+	};
+	static std::map<uint32_t, Flying> s_flying{};
+
+	struct PendingMessage {
+		uint32_t target;
+		__int64 script;
+		__int64 message;
+		int tries = 0;
+	};
+	static std::vector<PendingMessage> s_pending_messages{};
+
+	void projectile_created(Entity* projectile) {
+		auto ss = projectile ? projectile->getById<Component_23_Statescript>(0x23) : nullptr;
+		if (!ss)
+			return;
+		for (auto& kind : LANDING_PROJECTILES) {
+			if (!ss->ss_inner.getByResourceId(kind.script))
+				continue;
+			auto backref = projectile->getById<Component_1F_Backref>(0x1F);
+			auto scene = projectile->getById<Component_1_SceneRendering>(1);
+			s_flying[projectile->entity_id] = { &kind, backref ? backref->backref_entid : 0,
+				scene ? Vector3(scene->position.X, scene->position.Y, scene->position.Z) : Vector3() };
+			return;
+		}
+	}
+
+	static void land_projectiles() {
+		for (auto it = s_flying.begin(); it != s_flying.end();) {
+			auto& [id, flying] = *it;
+			if (auto ent = GameEntityAdmin()->getEntById(id)) {
+				if (auto scene = ent->getById<Component_1_SceneRendering>(1))
+					flying.position = Vector3(scene->position.X, scene->position.Y, scene->position.Z);
+				++it;
+				continue;
+			}
+			auto kind = flying.kind;
+			auto owner = flying.owner ? GameEntityAdmin()->getEntById(flying.owner) : nullptr;
+			auto hero = hero_of(owner);
+			auto hero_scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
+			Vector4 rotation = hero_scene ? hero_scene->rotation : Vector4(0, 0, 0, 1);
+			auto res = try_load_resource(kind->entity_def);
+			auto landed = res ? spawn(kind->entity_def, res, flying.position, rotation, owner, hero) : nullptr;
+			LOG_CORE(Info, "[NODES] projectile {} landed at ({:.2f}, {:.2f}, {:.2f}): placed {:X} as {}\n", id, flying.position.X,
+				flying.position.Y, flying.position.Z, kind->entity_def, landed ? landed->entity_id : 0);
+			if (landed)
+				s_pending_messages.push_back({ landed->entity_id, kind->script, kind->message });
+			it = s_flying.erase(it);
+		}
+	}
+
+	static void send_pending_messages() {
+		auto pending = std::move(s_pending_messages);
+		s_pending_messages.clear();
+		for (auto& msg : pending) {
+			auto ent = GameEntityAdmin()->getEntById(msg.target);
+			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+			auto inst = ss ? ss->ss_inner.getByResourceId(msg.script) : nullptr;
+			int delivered = inst && inst->graph ? deliver_game_message(inst, msg.message) : 0;
+			if (delivered)
+				LOG_CORE(Info, "[NODES] message {:X} delivered to {} ({} entries)\n", msg.message, msg.target, delivered);
+			else if (ent && ++msg.tries < MESSAGE_TRIES)
+				s_pending_messages.push_back(msg);
+			else
+				LOG_CORE(Warn, "[NODES] message {:X} for {}: script {:X} not ready\n", msg.message, msg.target, msg.script);
+		}
 	}
 
 	//What the server answers after one of these creation nodes created its entity, a tick later: copy the new entity
@@ -831,29 +969,23 @@ namespace server_nodes {
 		uint32_t view = 0;
 		__int64 script = 0; //Script whose PossessControl state runs
 		double started = 0;
+		double fired = 0; //When primary fire was pressed during it
 	};
 
-	//Possessed entities the server ends: RIP-Tire explodes on primary fire or after its time runs out (removing it
-	//ends the possession: Junkrat's graph sees it gone and returns to normal). The explosion itself is not emulated.
-	//keep_camera: the possessed entity has no camera of its own (the server's view is third person), so the camera
-	//stays with the hero instead of ending up inside it.
+	//Possessed entities that end on their own: the RIP-Tire's script (run with authority, see entity_runs_node_hook)
+	//detonates it on primary fire or when its time runs out, then destroys it (removing it ends the possession:
+	//Junkrat's graph sees it gone and returns to normal). Fallback if it is still there: remove it this long after
+	//primary fire or after this long in all.
 	struct TimedPossession {
 		__int64 script;
 		double secs;
-		bool keep_camera;
 	};
 	static constexpr TimedPossession TIMED_POSSESSIONS[] = {
-		{ 0x580000000000232, 10.0, true }, //RIP-Tire
+		{ 0x580000000000232, 15.0 }, //RIP-Tire
 	};
-
-	static bool keeps_camera(__int64 script) {
-		for (auto& timed : TIMED_POSSESSIONS)
-			if (timed.script == script)
-				return timed.keep_camera;
-		return false;
-	}
 	static constexpr int BUTTON_FIRE = 93;
 	static constexpr double POSSESSION_FIRE_GRACE_SECS = 0.5; //The press that started it
+	static constexpr double POSSESSION_AFTER_FIRE_SECS = 3.0; //The tire's detonation takes 2 s
 	static Possession s_possession{};
 
 	static uint32_t s_possession_hero() {
@@ -880,15 +1012,17 @@ namespace server_nodes {
 	}
 
 	static void end_timed_possession() {
-		bool fired = fire_pressed();
+		auto now = GetGameRuntimeSecs();
+		if (fire_pressed() && !s_possession.fired && now - s_possession.started > POSSESSION_FIRE_GRACE_SECS)
+			s_possession.fired = now;
 		for (auto& timed : TIMED_POSSESSIONS) {
 			if (timed.script != s_possession.script)
 				continue;
-			double elapsed = GetGameRuntimeSecs() - s_possession.started;
-			if (elapsed < timed.secs && !(fired && elapsed > POSSESSION_FIRE_GRACE_SECS))
+			bool after_fire = s_possession.fired && now - s_possession.fired > POSSESSION_AFTER_FIRE_SECS;
+			if (now - s_possession.started < timed.secs && !after_fire)
 				return;
 			if (auto ent = GameEntityAdmin()->getEntById(s_possession.control)) {
-				LOG_CORE(Info, "[NODES] possession of {} ended ({})\n", s_possession.control, fired ? "fire" : "time");
+				LOG_CORE(Info, "[NODES] possessed entity {} still there, removed ({})\n", s_possession.control, after_fire ? "fire" : "time");
 				s_created.erase(s_possession.control);
 				GameEntityAdmin()->delEnt(ent);
 			}
@@ -934,13 +1068,17 @@ namespace server_nodes {
 		if (control != s_possession.control) {
 			s_possession.script = control_script;
 			s_possession.started = GetGameRuntimeSecs();
+			s_possession.fired = 0;
 		}
 		if (!s_possession.hero)
 			s_possession.hero = hero_id;
-		uint32_t drive = control ? control : s_possession.hero;
-		ref->movement_attach_entid = drive;
-		ref->aim_entid = drive;
-		ref->cam_attach_entid = view && !keeps_camera(s_possession.script) ? view : s_possession.hero;
+		//Ending, control goes back only if it is still on the possessed entity (a hero switch meanwhile moved it on)
+		if (control || ref->movement_attach_entid == s_possession.control) {
+			uint32_t drive = control ? control : s_possession.hero;
+			ref->movement_attach_entid = drive;
+			ref->aim_entid = drive;
+			ref->cam_attach_entid = view ? view : s_possession.hero;
+		}
 		LOG_CORE(Info, "[NODES] possession: control {} view {} (hero {}; previous {} {})\n", control, view, s_possession.hero,
 			s_possession.control, GameEntityAdmin()->getEntById(s_possession.control) ? "exists" : "is gone");
 		s_possession.control = control;
@@ -949,9 +1087,211 @@ namespace server_nodes {
 			s_possession = {};
 	}
 
+	//
+	// Clocks: a statescript component's clock (sync manager +0x2c4 frame, +0x2d0/+0x2d8 time) advances in its update
+	// (sync manager vfunc 0xD13C20 -> 0xF44EF0(frame, frames)), which runs timers and timed states. The game runs it
+	// for the entities it simulates; the entities the server creates follow the server instead. For the entities
+	// created here it ran only on their first frame or two, so their clocks stopped right after their creation: no
+	// wait ever ended (the RIP-Tire's 2 s release from Junkrat, the dragons' flight) and no timed state moved.
+	// Advance each by as many frames as the local player's clock advanced since the last tick (the player's frame
+	// count restarts with a new hero), one update per frame.
+	//
+	static constexpr __int64 RVA_SYNC_MGR_UPDATE = 0xD13C20;
+	static constexpr int VTABLE_SEARCH_SLOTS = 256;
+	static constexpr int MAX_FRAMES_PER_TICK = 8;
+
+	//The local player's statescript clock: the entity (its hero; its controller's clock does not run) and its frame;
+	//0 without one.
+	static std::pair<uint32_t, int> local_frame() {
+		auto controller = GameEntityAdmin()->getLocalEnt();
+		uint32_t ids[] = { s_possession.hero, hero_of(controller) ? hero_of(controller)->entity_id : 0 };
+		for (auto id : ids) {
+			auto ent = id && !s_created.count(id) ? GameEntityAdmin()->getEntById(id) : nullptr;
+			if (auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr)
+				return { id, ss->ss_inner.increasing_counter1 };
+		}
+		return { 0, 0 };
+	}
+
+	static void run_clocks() {
+		static int s_slot = -1; //Of the update in the sync manager's vtable, found on first use (-2: not found)
+		static std::pair<uint32_t, int> s_last{};
+		static std::map<uint32_t, int> s_frames{}; //Entity -> the frame its clock was last set to here
+		auto now = local_frame();
+		int frames = now.first && now.first == s_last.first ? std::clamp(now.second - s_last.second, 0, MAX_FRAMES_PER_TICK) : 0;
+		s_last = now;
+		if (!frames || s_slot == -2)
+			return;
+		std::vector<uint32_t> ids(s_created.begin(), s_created.end()); //Their scripts create and destroy entities
+		for (auto id : ids) {
+			auto ent = GameEntityAdmin()->getEntById(id);
+			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+			if (!ss) {
+				s_frames.erase(id);
+				continue;
+			}
+			auto& mgr = ss->ss_inner;
+			//The game runs a new entity's update itself for its first frame or two (setting its clock), and sets every
+			//clock back to the new frame count when a hero spawns; skip the ticks it ran, keep a clock from going back
+			//(its pending timers would wait that much longer)
+			int frame = mgr.increasing_counter1;
+			auto it = s_frames.find(id);
+			if (!frame)
+				continue;
+			if (it != s_frames.end()) {
+				if (frame > it->second) {
+					it->second = frame;
+					continue;
+				}
+				frame = it->second;
+			}
+			auto vtable = *(__int64**)&mgr;
+			if (s_slot == -1) {
+				for (int i = 0; i < VTABLE_SEARCH_SLOTS && s_slot == -1; i++)
+					if (vtable[i] == globals::gameBase + RVA_SYNC_MGR_UPDATE)
+						s_slot = i;
+				LOG_CORE(Info, "[NODES] statescript update: vtable slot {}\n", s_slot);
+				if (s_slot == -1) {
+					s_slot = -2;
+					return;
+				}
+			}
+			for (int i = 0; i < frames; i++)
+				((void(__fastcall*)(StatescriptSyncMgr*, int, int))vtable[s_slot])(&mgr, ++frame, 1);
+			s_frames[id] = frame;
+		}
+	}
+
+	//
+	// MoveTo (STUStatescriptStateMoveTo, C1035274): the server moves the entity (its character mover) to
+	// m_destinationPos at m_speed and ends the state on arrival. Nothing moves the entities created here, so the state
+	// never ended (Mei's Blizzard drone rises before its storm starts). Move their scene position there at that speed
+	// and end the state on arrival.
+	//
+	static constexpr unsigned NODE_MOVE_TO = 0xC1035274;
+	static constexpr __int64 RVA_END_STATE = 0xF4A9C0;
+	static constexpr float MOVE_TO_ARRIVED = 0.05f;
+	static constexpr double MAX_TICK_SECS = 0.1;
+
+	static void run_move_to() {
+		static double s_last = 0;
+		//Destination of each activation, evaluated when it is first seen (it is relative to the entity: the drone's is
+		//2 m above itself)
+		static std::map<std::pair<StatescriptState*, __int64>, Vector3> s_destinations{};
+		auto now = GetGameRuntimeSecs();
+		float dt = s_last ? (float)std::min(now - s_last, MAX_TICK_SECS) : 0.f;
+		s_last = now;
+		std::map<std::pair<StatescriptState*, __int64>, Vector3> destinations;
+		std::vector<StatescriptState*> arrived;
+		for (auto id : s_created) {
+			auto ent = GameEntityAdmin()->getEntById(id);
+			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+			auto scene = ent ? ent->getById<Component_1_SceneRendering>(1) : nullptr;
+			if (!ss || !scene)
+				continue;
+			for (auto inst : ss->ss_inner) {
+				if (!inst || !inst->graph)
+					continue;
+				for (auto& [idx, info] : statescript_logger::GetScriptState(inst)) {
+					if (info.is_finish_state || idx < 0 || idx >= inst->graph->m_nodes.count())
+						continue;
+					auto node = inst->graph->m_nodes.list()[idx];
+					if (!node || node_type(node) != NODE_MOVE_TO)
+						continue;
+					auto state = running_state(inst, node);
+					auto editable = node->graph_node.base.to_editable();
+					auto key = std::make_pair(state, info.change_timestamp);
+					StatescriptPrimitive destination{}, speed{};
+					if (!state)
+						continue;
+					if (auto it = s_destinations.find(key); it != s_destinations.end())
+						destinations[key] = it->second;
+					else if (eval(inst, editable, "m_destinationPos", destination))
+						destinations[key] = to_vec3(destination);
+					else
+						continue;
+					auto to = destinations[key];
+					float step = (eval(inst, editable, "m_speed", speed) ? speed.get_convert_float(1.f) : 1.f) * dt;
+					Vector3 delta(to.X - scene->position.X, to.Y - scene->position.Y, to.Z - scene->position.Z);
+					float distance = std::sqrt(delta.X * delta.X + delta.Y * delta.Y + delta.Z * delta.Z);
+					if (distance > std::max(step, MOVE_TO_ARRIVED)) {
+						scene->position.X += delta.X / distance * step;
+						scene->position.Y += delta.Y / distance * step;
+						scene->position.Z += delta.Z / distance * step;
+						continue;
+					}
+					scene->position.X = to.X;
+					scene->position.Y = to.Y;
+					scene->position.Z = to.Z;
+					LOG_CORE(Info, "[NODES] script {:X} on {}: moved to ({:.2f}, {:.2f}, {:.2f})\n", inst->script_id, id, to.X, to.Y, to.Z);
+					destinations.erase(key);
+					arrived.push_back(state);
+				}
+			}
+		}
+		s_destinations = std::move(destinations);
+		for (auto state : arrived) //Ending one starts the next states
+			((void(__fastcall*)(StatescriptState*, unsigned short, __int64))(globals::gameBase + RVA_END_STATE))(state, 1, 0);
+	}
+
+	//Debug: PROMETHEUS_WATCH_VARS=<script>:<var>,<var>,... (hex; a var's low digits, "4.1B0" for the path 0x...4 ->
+	//0x...1B0) logs those variables of that script on created entities twice a second, e.g. 580000000000132:497,4.1B0
+	static void watch_vars() {
+		static __int64 s_script = -1;
+		static std::vector<std::vector<__int64>> s_vars{};
+		static double s_last = 0;
+		if (s_script == -1) {
+			s_script = 0;
+			std::string env = getenv("PROMETHEUS_WATCH_VARS") ? getenv("PROMETHEUS_WATCH_VARS") : "";
+			auto colon = env.find(':');
+			if (colon != std::string::npos) {
+				s_script = std::stoll(env.substr(0, colon), nullptr, 16);
+				std::string list = env.substr(colon + 1) + ",";
+				for (size_t start = 0, end; (end = list.find(',', start)) != std::string::npos; start = end + 1) {
+					std::vector<__int64> path;
+					std::string var = list.substr(start, end - start) + ".";
+					for (size_t s = 0, e; (e = var.find('.', s)) != std::string::npos; s = e + 1)
+						if (e > s)
+							path.push_back(0xD80000000000000 | std::stoll(var.substr(s, e - s), nullptr, 16));
+					if (!path.empty())
+						s_vars.push_back(path);
+				}
+			}
+		}
+		auto now = GetGameRuntimeSecs();
+		if (!s_script || now - s_last < 0.5)
+			return;
+		s_last = now;
+		auto hero = hero_of(GameEntityAdmin()->getLocalEnt());
+		if (auto ss = hero ? hero->getById<Component_23_Statescript>(0x23) : nullptr)
+			LOG_CORE(Info, "[VARS] hero {}: cf {} counters {} {}\n", hero->entity_id, ss->ss_inner.cf_timestamp, ss->ss_inner.increasing_counter1, ss->ss_inner.increasing_counter3);
+		for (auto id : s_created) {
+			auto ent = GameEntityAdmin()->getEntById(id);
+			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+			auto inst = ss ? ss->ss_inner.getByResourceId(s_script) : nullptr;
+			if (!inst)
+				continue;
+			std::string values;
+			for (auto& path : s_vars) {
+				STUConfigVarDynamic_Custom cv(path);
+				StatescriptPrimitive value{};
+				bool ok = cv.cv_base.get_value(inst, &value);
+				values += std::format(" {:X}={}", path.back() & 0xFFFFFFFF, ok ? value.get_value_str() : std::string("-"));
+			}
+			auto head = (char*)inst->updates_1;
+			LOG_CORE(Info, "[VARS] script {:X} on {}:{} (cf {} counters {} {}, flags {:#x}, queue head {} at {})\n", s_script, id, values, inst->ss_inner->cf_timestamp,
+				inst->ss_inner->increasing_counter1, inst->ss_inner->increasing_counter3, inst->execution_flags, (void*)head, head ? *(__int64*)(head + 0x18) : 0);
+		}
+	}
+
 	void tick() {
 		if (!GameEntityAdmin())
 			return;
+		watch_vars();
+		run_clocks();
+		land_projectiles();
+		send_pending_messages();
+		run_move_to();
 		send_pending_replies();
 		run_pending_plays();
 		update_possession();
@@ -963,5 +1303,9 @@ namespace server_nodes {
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_TRAVERSE_LINK)));
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_FIND_STATE_FACTORY), (LPVOID)find_state_factory_hook, (PVOID*)&s_find_state_factory_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_FIND_STATE_FACTORY)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_ENTITY_RUNS_NODE), (LPVOID)entity_runs_node_hook, (PVOID*)&s_entity_runs_node_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_ENTITY_RUNS_NODE)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_ENTITY_LOCALLY_CONTROLLED), (LPVOID)entity_locally_controlled_hook, (PVOID*)&s_entity_locally_controlled_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_ENTITY_LOCALLY_CONTROLLED)));
 	}
 }
