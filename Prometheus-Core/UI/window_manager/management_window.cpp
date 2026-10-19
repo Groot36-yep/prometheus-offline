@@ -13,6 +13,7 @@
 #include "auto_test.h"
 #include "heroes.h"
 #include "display.h"
+#include "ultimate.h"
 
 std::map<int, std::string> s_worldstates = {
 	{ 0, "Shutdown" },
@@ -146,6 +147,15 @@ void management_window::render() {
 					}
 					if (ImGui::MenuItem("Borderless window", nullptr, display::borderless())) {
 						display::set_borderless(!display::borderless());
+					}
+					if (ImGui::BeginMenu("Ultimate charge")) {
+						if (ImGui::MenuItem("Charges over time (30 s)", nullptr, ultimate::mode() == ultimate::Mode::OverTime))
+							ultimate::set_mode(ultimate::Mode::OverTime);
+						if (ImGui::MenuItem("Always ready", nullptr, ultimate::mode() == ultimate::Mode::Ready))
+							ultimate::set_mode(ultimate::Mode::Ready);
+						if (ImGui::MenuItem("Off (never charges)", nullptr, ultimate::mode() == ultimate::Mode::Off))
+							ultimate::set_mode(ultimate::Mode::Off);
+						ImGui::EndMenu();
 					}
 					ImGui::Separator();
 					auto maps = get_maps();

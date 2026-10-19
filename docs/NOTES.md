@@ -278,16 +278,17 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
 - Tracing with `auto_test` `started` (every state an ability press starts, with node types) showed the volleys
   starting and finishing within a tick; graph dump node indexes are not runtime state indexes (`idx_in_m_states`).
 
-## Ultimates (still blocked, 2026-10-18)
+## Ultimates (2026-10-18)
 
-- Auto Test `ultprobe` sets each integer entity variable at 0 to 100, waits 1.5 s (its own effects become noise),
-  then presses ability_3. No variable makes any ultimate start (Tracer, Pharah, D.Va). An earlier version set the
-  variable and pressed in the same tick: `0xD800000000001DE` = 100 then caused 22 state changes, but those are the
-  variable's own effects (likely "ultimate ready" feedback), not the ultimate. D.Va's "ok" for ability_3 in normal
-  runs is one background change, not her ultimate.
-- Writing `0x1DE` continuously made other abilities look dead in Auto Test (constant churn learned as noise).
-- Next: the gate is in `STUStatescriptStateAbility` (runtime classes: vtable `0x15D81B0` from factory `0x1085520`,
-  derived `0x15D7C98` from `0xD61F60`); find what its start check reads for ultimates.
+- An ultimate's `STUStatescriptStateAbility` (Tracer: graph `0x580000000000034`, node 38, start button `0x79`) has an
+  `m_startCondition` expression over two of the hero's **entity variables**: the charge **`0xD80000000000156`** and
+  the hero's cost **`0xD80000000000152`** (Tracer 900, Pharah 1500). Read with `PROMETHEUS_DUMP_STU=580000000000034`
+  (the graph dump does not record expressions). The node sits under a boolean switch on entity variable `0x1880`.
+- The server raises the charge; offline it stayed 0. `ultimate.cpp` fills it: over 30 s (default), always ready, or
+  off (Play menu > Ultimate charge, `Prometheus/ultimate_settings.json`), following the value when the ultimate
+  spends it. Auto Test with "always ready": Pulse Bomb, Earthshatter and Barrage (~90 rockets) start.
+- Auto Test `ultprobe` (set each integer entity variable to 100, wait, press) found nothing because 100 is below
+  every cost; `0xD800000000001DE` reacts to being set (likely "ultimate ready" feedback), not the ultimate itself.
 - Auto Test `PROMETHEUS_DUMP_VARS` adds the hero's entity variables (id, type, value) to the report.
 
 ## Projectiles through walls (open)

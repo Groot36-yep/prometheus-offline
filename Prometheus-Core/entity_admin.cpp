@@ -19,6 +19,7 @@
 #include "quick_play.h"
 #include "auto_test.h"
 #include "display.h"
+#include "ultimate.h"
 #include <set>
 #include <deque>
 
@@ -1426,6 +1427,7 @@ void PrometheusSystem::OnTick(float tick) {
 	quick_play::tick(_input_component);
 	auto_test::tick(_input_component);
 	display::tick();
+	ultimate::tick();
 	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/
