@@ -151,23 +151,11 @@ struct Component_10_FilterBits {
         STRUCT_PLACE(__int64, filter_bits, 0x98); //0x400001
     };
 
+    //The team is in pre_filter_bits: FilterBitsMakeFinal (0xCBF660) derives filter_bits from them and passes the
+    //team on to the entity's other components, so a team written to filter_bits was lost.
     void set_team(int team) {
         owassert(team >= 0 && team < 4);
-        filter_bits &= ~(__int64)0x3C0000;
-        switch (team) {
-        case 0:
-            filter_bits |= 0x40000;
-            break;
-        case 1:
-            filter_bits |= 0x80000;
-            break;
-        case 2:
-            filter_bits |= 0x100000;
-            break;
-        case 3:
-            filter_bits |= 0x200000;
-            break;
-        }
+        pre_filter_bits = (pre_filter_bits & ~(__int64)0x3C0000) | ((__int64)FilterBit_Team0 << team);
     }
 
     //default values for controller entity

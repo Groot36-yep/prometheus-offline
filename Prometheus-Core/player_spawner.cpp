@@ -164,6 +164,10 @@ void player_spawner::template_localPlayer() {
 	controller_info.load_3f = true;
 	controller_info.movement_attach = 2; //Doch model sonst funktioniert F1 nicht
 	controller_info.set_filterbits_controller = false;
+	//The local player's team. Without one the hero's own turrets, Mei's storm and the like count as enemies (red
+	//outlines and effects): entities with no team are never friendly.
+	controller_info.team = 0;
+	model_info.team = 0;
 	model_info.resource_id = 0x400000000000001;
 	model_info.petbackref_attach = 1;
 	model_info.set_health = true;

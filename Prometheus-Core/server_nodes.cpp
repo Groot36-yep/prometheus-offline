@@ -9,6 +9,7 @@
 #include "Logs/Logs.h"
 #include "statescript_logger.h"
 #include "ultimate.h"
+#include "MovementState.h"
 #include <MinHook.h>
 #include <algorithm>
 #include <cmath>
@@ -193,6 +194,9 @@ namespace server_nodes {
 
 	//Entities created here; only these are removed by DestroyEntity below (never the hero or map entities).
 	static std::set<uint32_t> s_created{};
+	//The hero each was created for: the server removes a hero's turrets and the like when the player changes hero
+	//(their scripts then read the gone hero's position as the origin and moved there).
+	static std::map<uint32_t, uint32_t> s_created_for{};
 
 	static void run_shared_nodes(StatescriptInstance* inst) {
 		*(uint32_t*)((char*)inst + INSTANCE_FLAGS) |= INSTANCE_RUNS_SHARED_NODES;
@@ -240,6 +244,19 @@ namespace server_nodes {
 	//2108984C, a random yaw range in degrees (m_min, m_max; Mei's wall pillars: 0-359). Its owner is the script's.
 	static constexpr unsigned FIELD_RANDOM_YAW = 0x2108984C;
 
+	//An entity with a character mover (component 0x15: the RIP-Tire, Mei's Blizzard drone) is placed by the movement
+	//state in it, not by its scene position: spawned with only the scene position set it started at the map's origin
+	//and fell through the map. Same as the hero's placement at spawn (entity_admin.cpp).
+	static void set_mover_position(Entity* ent, Vector3 position) {
+		auto mover = ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+		if (!mover)
+			return;
+		auto& state = mover->movement_state_2;
+		state.absolute_position = Vector4(position.X, position.Y, position.Z, 0);
+		state.position_delta = Vector4(0, 0, 0, 0);
+		state.gravity_delta = Vector4(0, 0, 0, 0);
+	}
+
 	//Spawns an entity definition as the server would for its owner: owned by it (GetOwner in the new entity's scripts),
 	//on the team of the hero, its scripts run here with the server's authority.
 	static Entity* spawn(__int64 def, __int64 res, Vector3 position, Vector4 rotation, Entity* owner, Entity* hero) {
@@ -259,16 +276,20 @@ namespace server_nodes {
 			LOG_CORE(Warn, "[NODES] create entity: spawning {:X} failed\n", def);
 			return nullptr;
 		}
+		set_mover_position(ent, position);
 		if (auto backref = ent->getById<Component_1F_Backref>(0x1F); backref && owner) {
 			backref->backref_entid = owner->entity_id;
 			backref->backref_global_entid = owner->entity_global_id;
 		}
+		//On the hero's team (its pre_filter_bits: the final bits and the team the other components see derive from them)
 		auto hero_filter = hero ? hero->getById<Component_10_FilterBits>(0x10) : nullptr; //The hero's, not its controller's
 		if (auto filter = ent->getById<Component_10_FilterBits>(0x10); filter && hero_filter) {
-			filter->filter_bits = hero_filter->filter_bits;
+			filter->pre_filter_bits = hero_filter->pre_filter_bits;
 			filter->FilterBitsMakeFinal();
 		}
 		s_created.insert(ent->entity_id);
+		if (hero)
+			s_created_for[ent->entity_id] = hero->entity_id;
 		run_shared_nodes(ent);
 		return ent;
 	}
@@ -434,7 +455,7 @@ namespace server_nodes {
 			}
 			auto kind = flying.kind;
 			auto owner = flying.owner ? GameEntityAdmin()->getEntById(flying.owner) : nullptr;
-			auto hero = hero_of(owner);
+			auto hero = owner ? hero_of(owner) : hero_of(GameEntityAdmin()->getLocalEnt()); //Projectiles have no owner set
 			auto hero_scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
 			Vector4 rotation = hero_scene ? hero_scene->rotation : Vector4(0, 0, 0, 1);
 			auto res = try_load_resource(kind->entity_def);
@@ -970,6 +991,8 @@ namespace server_nodes {
 		__int64 script = 0; //Script whose PossessControl state runs
 		double started = 0;
 		double fired = 0; //When primary fire was pressed during it
+		Vector3 hero_position{}; //Where the hero stands while it possesses
+		bool driving = false;    //The player's movement drives the possessed entity (not while it is attached)
 	};
 
 	//Possessed entities that end on their own: the RIP-Tire's script (run with authority, see entity_runs_node_hook)
@@ -1009,6 +1032,58 @@ namespace server_nodes {
 		bool pressed = down && !s_was_down;
 		s_was_down = down;
 		return pressed;
+	}
+
+	//The possessing hero stays where it was (Junkrat while he drives his tire). Not held, it slid away at ~60 m/s during
+	//the tire's wind-up, taking the attached tire off the map: the tire sits 1.4 m in front of Junkrat, and the hero
+	//followed the entity the player now controls.
+	static constexpr float HOLD_TOLERANCE = 0.25f;
+
+	static void hold_hero(Entity* hero) {
+		auto scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
+		if (!scene)
+			return;
+		auto& held = s_possession.hero_position;
+		float dx = scene->position.X - held.X, dy = scene->position.Y - held.Y, dz = scene->position.Z - held.Z;
+		if (dx * dx + dy * dy + dz * dz < HOLD_TOLERANCE * HOLD_TOLERANCE)
+			return;
+		scene->position.X = held.X;
+		scene->position.Y = held.Y;
+		scene->position.Z = held.Z;
+		set_mover_position(hero, held);
+	}
+
+	//An entity attached to another (STUStatescriptStateAttach running on it: the RIP-Tire in Junkrat's hands during its
+	//wind-up) cannot be driven: driven, its mover took the attach offset for a position change and it shot across the
+	//map. The player drives it once released.
+	static constexpr unsigned NODE_ATTACH = 0x971645FE;
+	static constexpr double POSSESSION_ATTACH_SECS = 0.25; //Its scripts (and the attach) start a tick or two after it
+
+	static bool attached(uint32_t id) {
+		auto ent = GameEntityAdmin()->getEntById(id);
+		auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+		if (!ss)
+			return false;
+		for (auto inst : ss->ss_inner) {
+			if (!inst || !inst->graph)
+				continue;
+			for (auto& [idx, state] : statescript_logger::GetScriptState(inst))
+				if (!state.is_finish_state && idx >= 0 && idx < inst->graph->m_nodes.count() && node_type(inst->graph->m_nodes.list()[idx]) == NODE_ATTACH)
+					return true;
+		}
+		return false;
+	}
+
+	//Hands the player's movement and aim to the possessed entity, its mover starting where it is.
+	static void drive(Component_20_ModelReference* ref, uint32_t id) {
+		auto ent = GameEntityAdmin()->getEntById(id);
+		auto scene = ent ? ent->getById<Component_1_SceneRendering>(1) : nullptr;
+		if (scene)
+			set_mover_position(ent, Vector3(scene->position.X, scene->position.Y, scene->position.Z));
+		ref->movement_attach_entid = id;
+		ref->aim_entid = id;
+		s_possession.driving = true;
+		LOG_CORE(Info, "[NODES] possession: driving {}\n", id);
 	}
 
 	static void end_timed_possession() {
@@ -1059,6 +1134,9 @@ namespace server_nodes {
 			}
 		}
 		if (control && control == s_possession.control) {
+			hold_hero(hero);
+			if (!s_possession.driving && GetGameRuntimeSecs() - s_possession.started > POSSESSION_ATTACH_SECS && !attached(control))
+				drive(ref, control);
 			end_timed_possession();
 			if (view == s_possession.view)
 				return;
@@ -1069,15 +1147,17 @@ namespace server_nodes {
 			s_possession.script = control_script;
 			s_possession.started = GetGameRuntimeSecs();
 			s_possession.fired = 0;
+			if (auto scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr)
+				s_possession.hero_position = Vector3(scene->position.X, scene->position.Y, scene->position.Z);
 		}
 		if (!s_possession.hero)
 			s_possession.hero = hero_id;
 		//Ending, control goes back only if it is still on the possessed entity (a hero switch meanwhile moved it on)
-		if (control || ref->movement_attach_entid == s_possession.control) {
-			uint32_t drive = control ? control : s_possession.hero;
-			ref->movement_attach_entid = drive;
-			ref->aim_entid = drive;
+		if (control || ref->movement_attach_entid == s_possession.control || ref->movement_attach_entid == s_possession.hero) {
+			ref->movement_attach_entid = s_possession.hero;
+			ref->aim_entid = s_possession.hero;
 			ref->cam_attach_entid = view ? view : s_possession.hero;
+			s_possession.driving = false;
 		}
 		LOG_CORE(Info, "[NODES] possession: control {} view {} (hero {}; previous {} {})\n", control, view, s_possession.hero,
 			s_possession.control, GameEntityAdmin()->getEntById(s_possession.control) ? "exists" : "is gone");
@@ -1218,11 +1298,13 @@ namespace server_nodes {
 						scene->position.X += delta.X / distance * step;
 						scene->position.Y += delta.Y / distance * step;
 						scene->position.Z += delta.Z / distance * step;
+						set_mover_position(ent, Vector3(scene->position.X, scene->position.Y, scene->position.Z));
 						continue;
 					}
 					scene->position.X = to.X;
 					scene->position.Y = to.Y;
 					scene->position.Z = to.Z;
+					set_mover_position(ent, to);
 					LOG_CORE(Info, "[NODES] script {:X} on {}: moved to ({:.2f}, {:.2f}, {:.2f})\n", inst->script_id, id, to.X, to.Y, to.Z);
 					destinations.erase(key);
 					arrived.push_back(state);
@@ -1284,9 +1366,26 @@ namespace server_nodes {
 		}
 	}
 
+	static void remove_orphans() {
+		for (auto it = s_created_for.begin(); it != s_created_for.end();) {
+			auto ent = GameEntityAdmin()->getEntById(it->first);
+			if (ent && GameEntityAdmin()->getEntById(it->second)) {
+				++it;
+				continue;
+			}
+			if (ent) {
+				LOG_CORE(Info, "[NODES] entity {} removed: its hero {} is gone\n", it->first, it->second);
+				s_created.erase(it->first);
+				GameEntityAdmin()->delEnt(ent);
+			}
+			it = s_created_for.erase(it);
+		}
+	}
+
 	void tick() {
 		if (!GameEntityAdmin())
 			return;
+		remove_orphans();
 		watch_vars();
 		run_clocks();
 		land_projectiles();

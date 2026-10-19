@@ -25,6 +25,7 @@ namespace auto_test {
 		Loading,     //Map requested, waiting for "World Running"
 		Spawn,       //Spawn the next hero
 		Settle,      //Let the hero finish spawning; learn which states change on their own
+		CloseSelect, //Close the hero select the game opened, so screenshots show the world
 		Gap,         //Short pause before the next press, also used to learn background state changes
 		Press,       //Hold the button
 		Observe,     //Button released, still counting reactions
@@ -55,6 +56,8 @@ namespace auto_test {
 	using Hero = HeroInfo;
 
 	static constexpr int WORLD_STATE_RUNNING = 8;
+	static constexpr double CLOSE_SELECT_KEY_SECS = 1.0; //Between Escape and H
+	static constexpr double CLOSE_SELECT_SECS = 7.0;     //The screen stays black ~5 s; then the presses start
 	static constexpr double MENU_SETTLE_SECS = 8.0;
 	static constexpr double MAP_SETTLE_SECS = 3.0;
 	static constexpr double LOADING_TIMEOUT_SECS = 120.0;
@@ -89,6 +92,30 @@ namespace auto_test {
 	static size_t s_map_index = 0;
 	static __int64 s_map = 0;
 	static size_t s_action = 0;
+
+	//"sequence=<button>+<button>+..." (logical button names, e.g. ability_1+next_weapon+fire+fire) presses those instead,
+	//each followed by the fire probe, e.g. to place Torbjorn's turret, take out his hammer and hit the turret.
+	static const std::vector<Action>& actions() {
+		static std::vector<Action> s_actions{};
+		static std::vector<std::string> s_names{};
+		if (!s_actions.empty())
+			return s_actions;
+		auto pos = s_options.find("sequence=");
+		if (pos == std::string::npos) {
+			s_actions.assign(std::begin(HERO_ACTIONS), std::end(HERO_ACTIONS));
+			return s_actions;
+		}
+		std::string list = s_options.substr(pos + 9, s_options.find(',', pos) - pos - 9) + "+";
+		for (size_t start = 0, end; (end = list.find('+', start)) != std::string::npos; start = end + 1)
+			if (end > start)
+				s_names.push_back(list.substr(start, end - start));
+		s_actions.push_back({ "fire", true });
+		for (auto& name : s_names) {
+			s_actions.push_back({ name.c_str(), false });
+			s_actions.push_back({ "fire", true });
+		}
+		return s_actions;
+	}
 	static int s_spawn_attempts = 0;
 	static double s_hero_data_seen = -1;
 	static double s_press_started = 0;
@@ -586,6 +613,16 @@ namespace auto_test {
 		return out;
 	}
 
+	static void start_press();
+	static void start_ult_probe();
+
+	static void begin_presses() {
+		if (s_options.find("ultprobe") != std::string::npos)
+			start_ult_probe();
+		else
+			start_press();
+	}
+
 	static void start_press() {
 		s_entities_before.clear();
 		s_new_entities.clear();
@@ -612,15 +649,15 @@ namespace auto_test {
 	//without the others before it leaving locks behind.
 	static bool skipped(size_t action) {
 		auto pos = s_options.find("only=");
-		if (pos == std::string::npos || HERO_ACTIONS[action].probe)
+		if (pos == std::string::npos || actions()[action].probe)
 			return false;
 		auto only = s_options.substr(pos + 5, s_options.find(',', pos) - pos - 5);
-		return only != HERO_ACTIONS[action].button;
+		return only != actions()[action].button;
 	}
 
 	//Called when the current action is over (after Observe for probes, after Wait for abilities).
 	static void finish_action() {
-		auto& action = HERO_ACTIONS[s_action];
+		auto& action = actions()[s_action];
 		auto& hero = s_heroes[s_hero];
 		if (action.probe) {
 			bool fire_before = s_fire_ok;
@@ -659,9 +696,9 @@ namespace auto_test {
 		}
 
 		s_action++;
-		while (s_action < std::size(HERO_ACTIONS) && skipped(s_action))
+		while (s_action < actions().size() && skipped(s_action))
 			s_action += 2; //The ability and the fire probe after it
-		if (s_action >= std::size(HERO_ACTIONS))
+		if (s_action >= actions().size())
 			finish_hero();
 		else
 			set_step(Step::Gap);
@@ -807,10 +844,14 @@ namespace auto_test {
 		case Step::Idle:
 		case Step::Done:
 			break;
-		case Step::Exiting:
-			if (step_elapsed() > EXIT_DELAY_SECS)
+		case Step::Exiting: {
+			//"linger=<secs>" keeps the game open that long after the last press, e.g. to watch a turret in screenshots
+			auto linger = s_options.find("linger=");
+			double delay = linger != std::string::npos ? std::max(EXIT_DELAY_SECS, std::stod(s_options.substr(linger + 7))) : EXIT_DELAY_SECS;
+			if (step_elapsed() > delay)
 				TerminateProcess(GetCurrentProcess(), 0); //Also skips the known shutdown crash
 			break;
+		}
 		case Step::WaitForMenu:
 			if (step_elapsed() > MENU_SETTLE_SECS)
 				load_data();
@@ -897,12 +938,32 @@ namespace auto_test {
 					dump_map_entities();
 				}
 				LOG_CORE(Info, "[AUTOTEST] {}: {} states change on their own\n", s_heroes[s_hero].name, s_noise.size());
-				if (s_options.find("ultprobe") != std::string::npos)
-					start_ult_probe();
-				else
-					start_press();
+				if (hero_select_active()) {
+					set_step(Step::CloseSelect);
+					break;
+				}
+				begin_presses();
 			}
 			break;
+		case Step::CloseSelect: {
+			//The game opens hero select after every spawn and leaves it over the world (hero_select_active() stays true
+			//after it closes). Escape then H close it, so screenshots show the world. Keys only go to the game's window.
+			static int s_sent = 0;
+			DWORD pid = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+			BYTE key = s_sent == 0 ? VK_ESCAPE : 'H';
+			if (s_sent < 2 && step_elapsed() > s_sent * CLOSE_SELECT_KEY_SECS && pid == GetCurrentProcessId()) {
+				keybd_event(key, 0, 0, 0);
+				keybd_event(key, 0, KEYEVENTF_KEYUP, 0);
+				s_sent++;
+			}
+			if (step_elapsed() > CLOSE_SELECT_SECS) {
+				LOG_CORE(Info, "[AUTOTEST] closing hero select: {} keys sent\n", s_sent);
+				s_sent = 0;
+				begin_presses();
+			}
+			break;
+		}
 		case Step::UltGap:
 			track_states(Track::Follow);
 			if (step_elapsed() > GAP_SECS)
@@ -939,24 +1000,24 @@ namespace auto_test {
 			break;
 		case Step::Press:
 			if (!s_press_event_sent) {
-				send_button_event(HERO_ACTIONS[s_action].button, true);
+				send_button_event(actions()[s_action].button, true);
 				s_press_event_sent = true;
 			}
-			set_button(input, HERO_ACTIONS[s_action].button, true);
+			set_button(input, actions()[s_action].button, true);
 			track_states(Track::Count);
 			track_new_entities();
 			if (step_elapsed() > PRESS_SECS) {
-				set_button(input, HERO_ACTIONS[s_action].button, false);
-				send_button_event(HERO_ACTIONS[s_action].button, false);
+				set_button(input, actions()[s_action].button, false);
+				send_button_event(actions()[s_action].button, false);
 				set_step(Step::Observe);
 			}
 			break;
 		case Step::Observe:
-			set_button(input, HERO_ACTIONS[s_action].button, false);
+			set_button(input, actions()[s_action].button, false);
 			track_states(Track::Count);
 			track_new_entities();
 			if (GetGameRuntimeSecs() - s_press_started > REACTION_SECS) {
-				if (HERO_ACTIONS[s_action].probe)
+				if (actions()[s_action].probe)
 					finish_action();
 				else
 					set_step(Step::Wait);

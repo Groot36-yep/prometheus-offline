@@ -429,5 +429,33 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   emulated for created entities by moving their component 1 position and ending the state on arrival.
 - Debug: `PROMETHEUS_WATCH_VARS=<script>:<var>,...` (hex, `4.1B0` for a two-step path) logs those variables and the
   instance's clock, flags and queue head for that script on created entities twice a second (`[VARS]`).
-- Open (2026-10-19): confirm in game: the tire's chase camera and steering, the dragons' look, Mei's storm, turrets
-  shooting (no enemies offline to shoot at); Zarya's Graviton vortex.
+- Teams (2026-10-19): a Component_10 team lives in `pre_filter_bits` (`+0x90`, team bits `0x3C0000`).
+  FilterBitsMakeFinal (`0xCBF660`) derives `filter_bits` (`+0x98`) from it and passes the team on to other components,
+  so the spawner's `set_team` (which wrote `filter_bits`) never took effect: the local hero had no team at all, and
+  entities with no team are never friendly. Torbjorn's turret had a red (enemy) outline and Mei's storm was red with
+  the hero and turret both team-less, and with only the turret on a team; with both on team 0 the outline is gone.
+  The spawner now puts the local controller and hero on team 0 and created entities copy the hero's pre bits.
+- Character movers (component `0x15`; the RIP-Tire, Mei's drone): their position is the movement state at `+0xA50`
+  (absolute position `+0xC70`), as for the hero's spawn. Created with only the scene position set they started at
+  the map origin. `set_mover_position` writes it on spawn and for MoveTo.
+- RIP-Tire possession: var `0x26` (the tire) is the creation node's out var, so Junkrat's PossessControl (node 79)
+  starts the moment the tire exists, during the 2 s wind-up while the tire is attached to him (StateAttach
+  `971645FE`, tire node 88). Driven then, the tire's mover took the attach offset (`0, 0, 1.4`) as a step each frame
+  and Junkrat followed the controlled entity: both slid ~60-90 m/s off the map, where the tire fell into the void.
+  Now the hero is held in place during a possession, and the player's movement and aim go to the possessed entity
+  only once no StateAttach runs on it (checked from 0.25 s after it starts); its mover is synced to its scene
+  position then. Auto Test with screenshots: the tire waits in Junkrat's hands, then rolls along the floor with the
+  third-person camera, detonate prompt and 10 s timer, and stops at walls.
+- Entities created for a hero are removed when that hero is gone (hero change): the server removes a hero's turret
+  then. Left alone, Torbjorn's turret moved to the map origin once he was deleted.
+- Auto Test sees the world now: the game opens hero select after every spawn and STUConfigVarIsHeroSelectActive
+  stays true after it closes. Escape then H (keybd_event, only while the game window has focus) close it; the screen
+  is black for ~5 s before the world shows. `C:\tools\re\run_vis.ps1 -Heroes ... -Label x` runs the Auto Test with
+  screenshots (`capture.ps1`) into `C:\tools\re\out\shots_x`. New options: `linger=<secs>` keeps the game open
+  after the last press, `sequence=a+b+c` presses those logical buttons (names as in the game's list, e.g.
+  `next_weapon`, `equip_weapon_1`) instead of the usual ones. The hero overview videos play in the built-in browser
+  (file URL), seekable from JavaScript, for comparison.
+- Open (2026-10-19): Torbjorn's turret upgrade: hammer hits change nothing in the turret's script (`0xC9`), which
+  waits for server messages `0x8F`/`0x90` and others; the turret also keeps its burning look. Mei's drone model is
+  not seen in the storm. Projectiles through floors (Junkrat's grenades end up far away; not settled). Zarya's
+  Graviton vortex.
