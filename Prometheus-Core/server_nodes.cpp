@@ -1382,8 +1382,15 @@ namespace server_nodes {
 		}
 	}
 
+	//Created entities are only touched while a map runs: deleting one while a map unloads crashed the world loader
+	//(0xC39340, after Play switched maps with an Ice Wall pillar still up).
+	static constexpr int WORLD_STATE_RUNNING = 8;
+
 	void tick() {
 		if (!GameEntityAdmin())
+			return;
+		auto world = get_system27_WorldEngineSystem(GameEntityAdmin());
+		if (!world || world->world_state != WORLD_STATE_RUNNING)
 			return;
 		remove_orphans();
 		watch_vars();
