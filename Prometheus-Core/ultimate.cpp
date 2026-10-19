@@ -57,12 +57,24 @@ namespace ultimate {
 		return false;
 	}
 
-	void tick() {
-		static double s_last_update = 0;
-		static Component_23_Statescript* s_hero = nullptr;
-		static double s_charge = 0;
-		static int s_written = -1;
+	static double s_last_update = 0;
+	static Component_23_Statescript* s_hero = nullptr;
+	static double s_charge = 0;
+	static int s_written = -1;
 
+	void spend() {
+		auto ss = local_hero_statescript();
+		auto bag = ss ? ss->ss_inner.rid_entity_varbag : nullptr;
+		if (!bag)
+			return;
+		bag->SetVar({ StatescriptVar_ENTITY_VARBAG, ULTIMATE_CHARGE_VAR }, StatescriptPrimitive(0, StatescriptPrimitive_INT));
+		s_hero = ss;
+		s_charge = 0;
+		s_written = 0;
+		LOG_CORE(Info, "Ultimate used: charge set to 0\n");
+	}
+
+	void tick() {
 		if (setting() == Mode::Off || !GameEntityAdmin())
 			return;
 		auto now = GetGameRuntimeSecs();

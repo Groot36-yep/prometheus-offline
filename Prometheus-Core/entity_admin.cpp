@@ -20,6 +20,7 @@
 #include "auto_test.h"
 #include "display.h"
 #include "ultimate.h"
+#include "server_nodes.h"
 #include <set>
 #include <deque>
 
@@ -1146,6 +1147,7 @@ void PrometheusSystem::OnTick(float tick) {
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_VOLLEY_UPDATE)));
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_WEAPON_STATE_START), (LPVOID)weapon_state_start_hook, (PVOID*)&s_weapon_state_start_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_WEAPON_STATE_START)));
+		server_nodes::install();
 	}
 
 	if (!_applied_quick_play) {
@@ -1428,6 +1430,7 @@ void PrometheusSystem::OnTick(float tick) {
 	auto_test::tick(_input_component);
 	display::tick();
 	ultimate::tick();
+	server_nodes::tick();
 	if (_input_component) {
 		/*char* curr = _input_component->tick10 ? _input_component->stru1.tick0 : _input_component->stru1.tick1;
 		char* prev = _old_lbutton_states;*/

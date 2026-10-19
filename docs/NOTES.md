@@ -301,3 +301,72 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   impact is the projectile component's job, not a script. The spawner path (type 1) also sets filter bit
   `0x800000` on component `0x10` (`0xCD0B00`), but these projectiles have no component `0x10`.
 - `0xD45240` clears projectile component `+0xE2A` after every creation (it is not the "predicted" difference).
+
+## Server-only statescript nodes: deployables (2026-10-18)
+
+- Node implementations come from registration records `{.., factory, type descriptor, group, enable flag, 3}` in
+  `.data` (`0x1B2xxxx`-`0x1B4xxxx`); the lookup table is `DAT 0x7ff7b6574d18` (actions: `0xF433A0`, states: factory
+  lookup `0xF43450`). Group 2 is the shared implementation (what the server runs); group 1 registers client
+  versions over 21 of them (`C:\tools\re\registries2.py`). Some group-1 versions are stubs with every slot a
+  no-op, so offline the state did nothing: the placement state `160C4F1D` (stub vtable `0x15D6F40`, real class
+  factory `0xD64380` / vtable `0x15D5E68`), StateFindGround (stub `0x15D6598`, real `0xD64110`) and Mei's wall
+  states `12AA4F0F` (stub `0x15D6CC8`) and `614C3A0A` (stub `0x15D6A70`). Exact vtables from the constructors:
+  `C:\tools\re\dual_compare.py`. TrackRay, Shockwave and TrackTargets have real client versions (their group-2
+  extras are a few slots; TrackTargets' and Shockwave's slot 75 is only debug drawing).
+- Some node types have no implementation at all in the client: `1BB99C36` (the server's entity creation; Torbjorn's
+  turret, Symmetra's turrets and teleporter, Hanzo's Dragonstrike, Junkrat's RIP-Tire, D.Va calling her mech),
+  StatePet `4CCED352`, StatePossessControl `74CB0002`, StatePossessView `3A846155`, STUStatescriptActionCriteria
+  `4E83BC01`, StateModifyHealth `619D9E95`, StateApplyAura `D78490D1` and more (`out/unimplemented_nodes.txt`). An
+  action with none gets the base action (`0xF47740`: just follows its out plug).
+- Traversing a link into a node is `0xF471F0(from, instance, from node, ?, input plug, ?)`; the target node is
+  `plug + 0x18`. It skips the node when instance flags `+0x258` bit 2 is set or instance vfunc `0x88` refuses it.
+  `0xF46F80(from, instance, node, output plug, 0x80)` follows every link of an output plug.
+- `server_nodes.cpp`:
+  - Traces nodes the graph reaches that have no implementation or that the instance refuses (`[NODES]` in the
+    log, once per script and node).
+  - Emulates `1BB99C36`: fields `m_entityDefinition` (`m_entityDef`), `679AF128` owner (usually
+    GetEntityController(GetOwner)), `m_position` (vec3 or entity), `87018F61` forward, `99EEFF9F` up (surface
+    normal), `m_basedEntity` (not used), `D7C59487` dynamic var receiving the new entity. Spawned with
+    `EntityLoader` (component 1 init data: position, rotation from forward/up with Z forward and Y up, which matches
+    the hero's rotation), backref `0x1F` to the owner, filter bits from the creating entity, then the output var
+    set through the instance varbag (vfunc `0xE0`, as ActionSetVar does). Hanzo's dragon is created at the world
+    origin on purpose: its script (`0x580000000000132`, started by PlayScript with the start position as a parameter)
+    places its cosmetic dragons at absolute offsets.
+  - Swaps the stubs above for the shared implementation (hook on `0xF43450`).
+  - Placement (`160C4F1D`): the real class's tick (`0x1096500`) traces for a spot and exposes state values
+    (position `+0xc0`, valid `+0xb0`, hit `+0xb1`, normal `+0xd0`, forward `+0xe0`) through its output vars
+    (fields `+0x198`..`+0x1e8`, bound on begin by `0xD6DC20`). Input plug `C63FD388` (type `8DCB62EA`) means "place
+    now" (Torbjorn's fire button, RIP-Tire on begin); the server answers with output `02701BF5` (placed) or
+    `D3894419` (no valid spot) and writes the placed position/normal/forward to fields `C500D8CF`, `57216848`,
+    `2650F0BE` (vars `0x65A`, `0x9B1`, `0x9B2` for Torbjorn). Offline the input only restarted the state. Emulated:
+    run the update, write those three vars, fire the matching output. Input plug type `E51F3E8D` is abort.
+- Possession (StatePossessControl `74CB0002` field `743B15A6`, StatePossessView `3A846155` field `D7148C41`, both
+  without client implementation; Junkrat's RIP-Tire `0x232`, D.Va's Call Mech `0x26A`): the controller's
+  component `0x20` holds the entities it drives (`movement_attach`, `aim`) and the camera follows (`cam_attach`);
+  `server_nodes::tick` points them at the possessed entity while such a state runs on the hero, and back after.
+- StateFindGround's real class (`0xD64110`, vtable `0x15D60D8`) writes its output vars itself on begin (`0xD6D270`)
+  and exposes state values 0 position `+0xb0`, 1 found `+0xc8`, 2 `+0xc0`; its output `02701BF5` is the server's.
+- Auto Test: Torbjorn's turret (`0x400000000000143`, runs scripts `0x33` and `0xC9`), Symmetra's turret (`0x251`,
+  scripts `0x18E`) and teleporter (`0x233`), Hanzo's dragon (`0x2BA`) and RIP-Tire (`0x39C`, script `0x234`) are
+  created at the placed spot, facing where the hero faces.
+- Pets (STUStatescriptStatePet `4CCED352`, no client implementation; Zarya `0x244`/`0x25C`, Mei's Cryo-Freeze `0x5FE`):
+  same fields as `1BB99C36`; spawned when a link enters the state's `m_beginPlug`, removed once the state finished.
+- Ultimate charge: Junkrat's graph sets the charge (`0xD80000000000156`) to 0 only on game message `0x2400000000005BA`,
+  which the server sends. Offline the charge stayed full and RIP-Tire restarted every time the graph came back to
+  its ready state (1.5 s). `server_nodes` now calls `ultimate::spend()` when a StateAbility whose `m_startButton`
+  is `0x79` follows a link (it does when it activates).
+- Game messages: the client's SendGameMessage (`0xD794F0`) delivers only to the local player's own scripts; other
+  targets and every server message are lost offline. A message can be delivered by running the graph's
+  EntryGameMessage nodes (`BE49A4C2`) for it (`StatescriptInstance::ExecuteNode`).
+- Node type `138CCAB0` (core factory `0xF469E0`, execute `0xF47430`) is a join: it records arrivals keyed by
+  (source node, context) and follows its out plug once all of them came (`0xF47660`). RIP-Tire's join (node 19)
+  waits for Junkrat's 1.5 s wind-up (node 22, transition plug) and server message `0x24000000000013E` (entry 18);
+  it then sets var `0x26` (the possessed tire) from var `0x28` and switches the graph to driving (switch var
+  `0x6C7` = 2). Emulated as a "server reply" a tick after node 32 created the tire: var `0x28` = tire, deliver
+  `0x13E`. Without it the graph returned to ready after 1.5 s, which clears var `0x26` and ends possession.
+- RIP-Tire ends when the server explodes it; offline it never would. Removing the tire on primary fire or after
+  10 s ends the possession and the graph returns to normal (no explosion). The tire has no camera of its own (the
+  server's view is third person), so the camera stays with Junkrat.
+- Debug: `PROMETHEUS_TRACE_LINKS=<script id>` logs every link that script follows (`[LINK]` lines).
+- Open: Mei's Ice Wall needs the server's outputs of StateFindGround (`02701BF5`) and the wall segment states
+  (`8CF01B33`); the RIP-Tire explosion; not yet checked in game whether turrets shoot or the tire drives.

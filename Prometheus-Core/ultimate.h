@@ -14,6 +14,10 @@ namespace ultimate {
 	Mode mode();
 	void set_mode(Mode mode);
 
+	//An ultimate started: the server sets the charge to 0 then, nothing does offline (it stayed full, so the ultimate
+	//could start again at once, e.g. RIP-Tire every time Junkrat's graph returned to its ready state).
+	void spend();
+
 	//Called every tick from PrometheusSystem::OnTick.
 	void tick();
 }
