@@ -608,6 +608,16 @@ namespace auto_test {
 		return "ok";
 	}
 
+	//"only=<button>" (e.g. only=ability_3): press just that ability (and the fire probes), so one ability can be tested
+	//without the others before it leaving locks behind.
+	static bool skipped(size_t action) {
+		auto pos = s_options.find("only=");
+		if (pos == std::string::npos || HERO_ACTIONS[action].probe)
+			return false;
+		auto only = s_options.substr(pos + 5, s_options.find(',', pos) - pos - 5);
+		return only != HERO_ACTIONS[action].button;
+	}
+
 	//Called when the current action is over (after Observe for probes, after Wait for abilities).
 	static void finish_action() {
 		auto& action = HERO_ACTIONS[s_action];
@@ -649,6 +659,8 @@ namespace auto_test {
 		}
 
 		s_action++;
+		while (s_action < std::size(HERO_ACTIONS) && skipped(s_action))
+			s_action += 2; //The ability and the fire probe after it
 		if (s_action >= std::size(HERO_ACTIONS))
 			finish_hero();
 		else

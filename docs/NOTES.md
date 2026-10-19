@@ -368,5 +368,27 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   10 s ends the possession and the graph returns to normal (no explosion). The tire has no camera of its own (the
   server's view is third person), so the camera stays with Junkrat.
 - Debug: `PROMETHEUS_TRACE_LINKS=<script id>` logs every link that script follows (`[LINK]` lines).
-- Open: Mei's Ice Wall needs the server's outputs of StateFindGround (`02701BF5`) and the wall segment states
-  (`8CF01B33`); the RIP-Tire explosion; not yet checked in game whether turrets shoot or the tire drives.
+- Mei's Ice Wall: "place now" inputs (type `8DCB62EA`) chain: StateFindGround (input `C63FD388`, answer `02701BF5`,
+  valid byte `+0xc8`) -> wall start `12AA4F0F` (input `5556C513`, answer `8CF01B33`) -> five segments `614C3A0A`
+  (same plugs) -> the nodes creating the pillars. `PLACE_RULES` in `server_nodes.cpp` answers them all. Mei's
+  Blizzard was blocked only because the unfinished wall left its states (and an ability lock) running.
+- STUStatescriptActionCreateEntity (`0E3689F3`): the client's implementation (`0xD6EDA0`) only binds an entity the
+  server announced (map at component `+0x500`). Emulated for Mei's wall (fields `m_entityDef`, `m_position`,
+  `m_out_Entity`, `2108984C` random yaw range `m_min`/`m_max` in degrees). Also used by `0xC9`, `0x1C7`, `0x5AD`
+  (not emulated yet; logged).
+- STUStatescriptActionDestroyEntity (`5C46D801`, `m_entity`): emulated for entities created here only.
+- STUStatescriptActionPlayScript (`F9EF59A6`, `0xD79C90`) and SendGameMessage play/deliver only on the local player;
+  other targets go to the server. Emulated for entities created here: load the script with authority
+  (Component_23 vfunc `0x60`), wait for its graph (built lazily, a few ticks), write the caller's `m_params`
+  (param id `C76B6366`, `m_value`) into the variables of the script's STUStatescriptEntryPlayScript (`46C48944`,
+  `m_params`: param id, `m_out_Var`; `m_out_Sender`), then run that entry. Hanzo's dragons (`0x132`), the tire
+  (`0x233`), Mei's pillars (`0x636`) and Cryo-Freeze block (`0x623`) get their scripts this way.
+- Instance vfunc `0x88` for entity scripts (`0xD739A0`): runs a node if it is not server-only (`+0x76`) and either
+  instance flags bit 12 is clear and bit 22 (`0x400000`) set, or the node is client-only (`+0x75`). Hero scripts
+  have bit 22 (`0x400081`); scripts on created entities did not (turret `0`, dragon `0x208009`), so they refused
+  nearly every node. Set on every script of created entities.
+- Safety: `get_argument_object`/`get_argument_primitive` crash on a field the type lacks; `field_object` looks
+  fields up by hash first. The game's GetEntityPos crashed for an entity value; positions are read from
+  component 1 instead.
+- Open (2026-10-19): not yet confirmed in game that turrets shoot, the tire drives, dragons and pillars appear; the
+  RIP-Tire explosion; Zarya's Graviton vortex.

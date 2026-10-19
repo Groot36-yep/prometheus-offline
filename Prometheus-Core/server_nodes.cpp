@@ -9,6 +9,7 @@
 #include "statescript_logger.h"
 #include "ultimate.h"
 #include <MinHook.h>
+#include <algorithm>
 #include <cmath>
 #include <format>
 #include <map>
@@ -24,6 +25,10 @@ namespace server_nodes {
 	static constexpr int INSTANCE_FLAGS = 0x258;
 	static constexpr int INSTANCE_RUNS_NODE_VFUNC = 0x88 / 8;
 	static constexpr int INSTANCE_OWNER_VFUNC = 0x1C8 / 8;
+	//Instance vfunc 0x88 (0xD739A0 for entity scripts) runs a node only if it is not server-only and the instance has
+	//this flag (or the node is client-only). The hero's scripts have it (0x400081); scripts on entities the server
+	//created for us do not (Torbjorn's turret 0, Hanzo's dragon 0x208009), so they refused nearly every node.
+	static constexpr uint32_t INSTANCE_RUNS_SHARED_NODES = 1 << 22;
 	static constexpr int PLUG_PARENT_NODE = 0x18;
 
 	using TraverseLinkFn = char(__fastcall*)(__int64 from_impl, StatescriptInstance* inst, STUStatescriptBase* from, __int64 a4, __int64 plug, int a6);
@@ -70,14 +75,56 @@ namespace server_nodes {
 	static constexpr unsigned FIELD_OUT_ENTITY = 0xD7C59487;
 	static constexpr double CREATE_REPEAT_SECS = 0.1; //A node re-entered this quickly is the same activation (resimulated)
 
+	//A field of a node, or an invalid object when its type has no such field (get_argument_object would crash).
+	static STU_Object field_object(STU_Object node, unsigned field) {
+		if (!node.valid())
+			return {};
+		for (auto [info, arg] : node.struct_info->RangeArgs())
+			if (arg->Hash == field)
+				return node.get_argument_object(arg);
+		return {};
+	}
+
+	static STU_Object field_object(STU_Object node, const char* field) {
+		return field_object(node, stringHash(field));
+	}
+
+	//An int field of an object (its runtime type), or the fallback when it has none.
+	static int field_int(STU_Object object, const char* field, int fallback) {
+		object = object.get_runtime_root();
+		if (!object.valid())
+			return fallback;
+		auto hash = stringHash(field);
+		for (auto [info, arg] : object.struct_info->RangeArgs())
+			if (arg->Hash == hash)
+				return object.get_argument_primitive(arg).get_value<int>();
+		return fallback;
+	}
+
 	static bool eval(StatescriptInstance* inst, STU_Object node, unsigned field, StatescriptPrimitive& out) {
-		auto cv = node.get_argument_object(field);
+		auto cv = field_object(node, field);
 		out = {};
 		return cv.valid() && ((STUConfigVar*)cv.value)->get_value(inst, &out) && out.type != 0;
 	}
 
 	static bool eval(StatescriptInstance* inst, STU_Object node, const char* field, StatescriptPrimitive& out) {
 		return eval(inst, node, stringHash(field), out);
+	}
+
+	//A vec3 value, or an entity's position (read from its component 1: the game's GetEntityPos crashed for some).
+	static Vector3 to_vec3(const StatescriptPrimitive& value) {
+		if (value.type == StatescriptPrimitive_VEC3) {
+			Vector3 v;
+			memcpy(&v, &value.value, sizeof(v));
+			return v;
+		}
+		if (value.type == StatescriptPrimitive_ENTITY) {
+			auto ent = GameEntityAdmin()->getEntById((uint32_t)value.value);
+			auto scene = ent ? ent->getById<Component_1_SceneRendering>(1) : nullptr;
+			if (scene)
+				return Vector3(scene->position.X, scene->position.Y, scene->position.Z);
+		}
+		return Vector3();
 	}
 
 	static Vector3 normalized(Vector3 v) {
@@ -141,10 +188,30 @@ namespace server_nodes {
 		return hero ? hero : owner;
 	}
 
-	//Spawns the entity a creation node (1BB99C36) or pet state (4CCED352) describes; same fields.
+	//Entities created here; only these are removed by DestroyEntity below (never the hero or map entities).
+	static std::set<uint32_t> s_created{};
+
+	static void run_shared_nodes(StatescriptInstance* inst) {
+		*(uint32_t*)((char*)inst + INSTANCE_FLAGS) |= INSTANCE_RUNS_SHARED_NODES;
+	}
+
+	static void run_shared_nodes(Entity* ent) {
+		if (auto ss = ent->getById<Component_23_Statescript>(0x23))
+			for (auto inst : ss->ss_inner)
+				if (inst)
+					run_shared_nodes(inst);
+	}
+
+	//STUStatescriptActionCreateEntity (0E3689F3) names its fields differently: m_entityDef, m_out_Entity, and
+	//2108984C, a random yaw range in degrees (m_min, m_max; Mei's wall pillars: 0-359). Its owner is the script's.
+	static constexpr unsigned FIELD_RANDOM_YAW = 0x2108984C;
+
+	//Spawns the entity a creation node (1BB99C36, 0E3689F3) or pet state (4CCED352) describes.
 	static Entity* spawn_from_node(StatescriptInstance* inst, STUStatescriptBase* stu) {
 		auto node = stu->graph_node.base.to_editable();
-		auto def_cv = node.get_argument_object("m_entityDefinition").get_runtime_root();
+		auto def_cv = field_object(node, "m_entityDefinition").get_runtime_root();
+		if (!def_cv.valid())
+			def_cv = field_object(node, "m_entityDef").get_runtime_root();
 		auto def = def_cv.valid() ? def_cv.get_argument_resource("m_entityDef")->resource_id : 0;
 		auto res = def ? try_load_resource(def) : 0;
 		if (!res) {
@@ -156,17 +223,26 @@ namespace server_nodes {
 		StatescriptPrimitive owner_value{}, position_value{}, forward_value{}, up_value{};
 		Entity* owner = eval(inst, node, FIELD_OWNER, owner_value) && owner_value.type == StatescriptPrimitive_ENTITY
 			? GameEntityAdmin()->getEntById((uint32)owner_value.value) : nullptr;
+		if (!owner && !field_object(node, FIELD_OWNER).valid())
+			owner = self;
 		auto hero = hero_of(owner ? owner : self);
 		auto hero_scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
 		Vector3 position = hero_scene ? Vector3(hero_scene->position.X, hero_scene->position.Y, hero_scene->position.Z) : Vector3();
 		if (eval(inst, node, "m_position", position_value)) //Without one (pets), at the hero
-			position = position_value.get_convert_vec3(inst);
-		Vector3 forward = eval(inst, node, FIELD_FORWARD, forward_value) ? forward_value.get_convert_vec3(inst) : Vector3();
-		Vector3 up = eval(inst, node, FIELD_UP, up_value) ? up_value.get_convert_vec3(inst) : Vector3();
+			position = to_vec3(position_value);
+		Vector3 forward = eval(inst, node, FIELD_FORWARD, forward_value) ? to_vec3(forward_value) : Vector3();
+		Vector3 up = eval(inst, node, FIELD_UP, up_value) ? to_vec3(up_value) : Vector3();
 
 		Vector4 rotation(0, 0, 0, 1);
+		auto yaw_range = field_object(node, FIELD_RANDOM_YAW);
 		if (forward.X != 0 || forward.Y != 0 || forward.Z != 0)
 			rotation = look_rotation(forward, up);
+		else if (yaw_range.valid()) {
+			int lo = field_int(yaw_range, "m_min", 0);
+			int hi = field_int(yaw_range, "m_max", 0);
+			float yaw = (lo + (hi > lo ? rand() % (hi - lo + 1) : 0)) * 3.14159265f / 180.f;
+			rotation = Vector4(0, std::sin(yaw / 2), 0, std::cos(yaw / 2));
+		}
 		else if (hero_scene && !position_value.type)
 			rotation = hero_scene->rotation;
 
@@ -192,13 +268,18 @@ namespace server_nodes {
 			backref->backref_entid = owner->entity_id;
 			backref->backref_global_entid = owner->entity_global_id;
 		}
-		auto self_filter = self ? self->getById<Component_10_FilterBits>(0x10) : nullptr;
+		auto self_filter = hero ? hero->getById<Component_10_FilterBits>(0x10) : nullptr; //The hero's, not its controller's
 		if (auto filter = ent->getById<Component_10_FilterBits>(0x10); filter && self_filter) {
 			filter->filter_bits = self_filter->filter_bits;
 			filter->FilterBitsMakeFinal();
 		}
 
-		if (auto out = node.get_argument_object(FIELD_OUT_ENTITY); out.valid() && inst->rid_instance_varbag) {
+		s_created.insert(ent->entity_id);
+		run_shared_nodes(ent);
+		auto out = field_object(node, FIELD_OUT_ENTITY);
+		if (!out.valid())
+			out = field_object(node, "m_out_Entity");
+		if (out.valid() && inst->rid_instance_varbag) {
 			STUConfigVar_Custom value(StatescriptPrimitive(ent->entity_id, StatescriptPrimitive_ENTITY));
 			auto bag = inst->rid_instance_varbag;
 			bag->base.stu_base.vfptr->SetConfigVarValueFromSTUConfigVar(bag, (STUConfigVarDynamic*)out.value, value.get(), 0);
@@ -228,7 +309,7 @@ namespace server_nodes {
 	static constexpr unsigned NODE_ENTRY_GAME_MESSAGE = 0xBE49A4C2;
 
 	static __int64 entry_message(STUStatescriptBase* node) {
-		auto cv = node->graph_node.base.to_editable().get_argument_object("m_gameMessage").get_runtime_root();
+		auto cv = field_object(node->graph_node.base.to_editable(), "m_gameMessage").get_runtime_root();
 		auto ref = cv.valid() ? cv.get_argument_resource("m_gameMessage") : nullptr;
 		return ref ? ref->resource_id : 0;
 	}
@@ -325,7 +406,7 @@ namespace server_nodes {
 	static std::map<std::pair<StatescriptInstance*, int>, Pet> s_pets{};
 
 	static void begin_pet(StatescriptInstance* inst, STUStatescriptBase* node, __int64 plug) {
-		auto begin = node->graph_node.base.to_editable().get_argument_object("m_beginPlug");
+		auto begin = field_object(node->graph_node.base.to_editable(), "m_beginPlug");
 		if (!begin.valid() || (__int64)begin.value != plug)
 			return;
 		auto key = std::make_pair(inst, node->idx_in_nodes);
@@ -347,6 +428,7 @@ namespace server_nodes {
 			}
 			if (ent) {
 				LOG_CORE(Info, "[NODES] pet {} removed (its state ended)\n", pet.entity);
+				s_created.erase(pet.entity);
 				GameEntityAdmin()->delEnt(ent);
 			}
 			it = s_pets.erase(it);
@@ -363,9 +445,6 @@ namespace server_nodes {
 	// D3894419 (no valid spot). Offline that input only restarted the state, so nothing was ever placed.
 	//
 	static constexpr unsigned NODE_PLACEMENT = 0x160C4F1D;
-	static constexpr unsigned FIELD_PLACE_INPUT = 0xC63FD388;
-	static constexpr unsigned FIELD_PLACED = 0x02701BF5;
-	static constexpr unsigned FIELD_NOT_PLACED = 0xD3894419;
 	static constexpr __int64 RVA_FIND_STATE_FACTORY = 0xF43450; //Creates a state's implementation for its node
 	static constexpr __int64 RVA_PLACEMENT_STUB_VTABLE = 0x15D6F40;
 	static constexpr __int64 RVA_PLACEMENT_UPDATE = 0x1096500;
@@ -443,38 +522,239 @@ namespace server_nodes {
 	}
 
 	static void write_placed(StatescriptInstance* inst, STU_Object node, StatescriptState* state) {
-		set_dynamic(inst, node.get_argument_object(FIELD_PLACED_POSITION), vec3((char*)state + PLACEMENT_POSITION));
-		set_dynamic(inst, node.get_argument_object(FIELD_PLACED_NORMAL), vec3((char*)state + PLACEMENT_NORMAL));
-		set_dynamic(inst, node.get_argument_object(FIELD_PLACED_FORWARD), vec3((char*)state + PLACEMENT_FORWARD));
+		set_dynamic(inst, field_object(node, FIELD_PLACED_POSITION), vec3((char*)state + PLACEMENT_POSITION));
+		set_dynamic(inst, field_object(node, FIELD_PLACED_NORMAL), vec3((char*)state + PLACEMENT_NORMAL));
+		set_dynamic(inst, field_object(node, FIELD_PLACED_FORWARD), vec3((char*)state + PLACEMENT_FORWARD));
 	}
 
-	//Answers "place now" like the server: placed if the spot is valid, once per activation of the state. Returns
-	//whether the link was that input; it is handled here either way (the client would restart the state for it).
-	static bool place(StatescriptInstance* inst, STUStatescriptBase* node, STUStatescriptBase* from, __int64 plug) {
+	//"Place now" inputs (type 8DCB62EA) the server answers; offline that input only restarted the state. Mei's Ice
+	//Wall chains them: StateFindGround's answer 02701BF5 is the "place now" of the wall start (12AA4F0F), whose answer
+	//8CF01B33 is the next segment's (614C3A0A, five of them), and the last one's leads to the nodes creating the wall.
+	struct PlaceRule {
+		unsigned type;
+		unsigned input;      //"Place now" input plug field
+		unsigned placed;     //Output plug field: placed
+		unsigned not_placed; //Output plug field: no valid spot (0: none)
+		int valid;           //Byte in the state that says the spot is valid (-1: always placed)
+		__int64 update;      //Recomputes the spot first (0: none)
+		bool write_placed;   //Write the placed position/normal/forward vars
+	};
+	static constexpr PlaceRule PLACE_RULES[] = {
+		{ NODE_PLACEMENT, 0xC63FD388, 0x02701BF5, 0xD3894419, PLACEMENT_VALID, RVA_PLACEMENT_UPDATE, true },
+		{ 0x72509D3B, 0xC63FD388, 0x02701BF5, 0, 0xc8, 0, false }, //STUStatescriptStateFindGround: +0xc8 ground found
+		{ 0x12AA4F0F, 0x5556C513, 0x8CF01B33, 0, -1, 0, false },
+		{ 0x614C3A0A, 0x5556C513, 0x8CF01B33, 0, -1, 0, false },
+	};
+
+	static const PlaceRule* place_rule(unsigned type) {
+		for (auto& rule : PLACE_RULES)
+			if (rule.type == type)
+				return &rule;
+		return nullptr;
+	}
+
+	static bool is_stub(StatescriptState* state, unsigned type) {
+		for (auto& server : SERVER_STATES)
+			if (server.type == type && *(__int64*)state == globals::gameBase + server.stub_vtable)
+				return true;
+		return false;
+	}
+
+	//Answers "place now" like the server, once per activation of the state. Returns whether the link was that input;
+	//it is handled here either way (the client would restart the state for it).
+	static bool place(StatescriptInstance* inst, STUStatescriptBase* node, STUStatescriptBase* from, __int64 plug, const PlaceRule& rule) {
 		static std::map<std::pair<StatescriptInstance*, int>, __int64> s_placed_activation{};
 		auto editable = node->graph_node.base.to_editable();
-		auto input = editable.get_argument_object(FIELD_PLACE_INPUT);
+		auto input = field_object(editable, rule.input);
 		if (!input.valid() || (__int64)input.value != plug)
 			return false;
 		auto& logged = statescript_logger::GetScriptNodeState(inst, node->idx_in_nodes);
 		auto state = running_state(inst, node);
-		if (logged.is_finish_state || !state || *(__int64*)state == globals::gameBase + RVA_PLACEMENT_STUB_VTABLE)
+		if (logged.is_finish_state || !state || is_stub(state, rule.type))
 			return true;
 		auto& placed = s_placed_activation[{ inst, node->idx_in_nodes }];
 		if (placed == logged.change_timestamp)
 			return true;
 		placed = logged.change_timestamp;
-		((void(__fastcall*)(StatescriptState*))(globals::gameBase + RVA_PLACEMENT_UPDATE))(state);
-		bool valid = *((char*)state + PLACEMENT_VALID) != 0;
-		if (valid)
+		if (rule.update)
+			((void(__fastcall*)(StatescriptState*))(globals::gameBase + rule.update))(state);
+		bool valid = rule.valid < 0 || *((char*)state + rule.valid) != 0;
+		if (valid && rule.write_placed)
 			write_placed(inst, editable, state);
-		auto out = editable.get_argument_object(valid ? FIELD_PLACED : FIELD_NOT_PLACED);
-		LOG_CORE(Info, "[NODES] place: script {:X} node {} (from node {}): {}\n", inst->script_id, node->idx_in_nodes,
-			from ? from->idx_in_nodes : -1, valid ? "placed" : "no valid spot");
+		unsigned out_field = valid ? rule.placed : rule.not_placed;
+		auto out = out_field ? field_object(editable, out_field) : STU_Object();
+		LOG_CORE(Info, "[NODES] place: script {:X} node {} type {:08X} (from node {}): {}\n", inst->script_id, node->idx_in_nodes,
+			rule.type, from ? from->idx_in_nodes : -1, valid ? "placed" : "no valid spot");
 		if (out.valid())
 			((char(__fastcall*)(StatescriptState*, StatescriptInstance*, STUStatescriptBase*, __int64, int))(globals::gameBase + RVA_TRAVERSE_PLUG))(
 				state, inst, node, (__int64)out.value, 0x80);
 		return true;
+	}
+
+	//
+	// STUStatescriptActionCreateEntity (0E3689F3): the client's implementation (work 0xD6EDA0) only binds an entity the
+	// server announced for the node (looked up in a map at component +0x500) and does nothing without one. Created
+	// here for the scripts below; it is also in Torbjorn's turret (0xC9) and two scripts every hero runs (0x1C7,
+	// 0x5AD), which are left alone until checked.
+	// STUStatescriptActionDestroyEntity (5C46D801, field m_entity) has no client implementation; it removes entities
+	// created here (Mei's previous pillars, Hanzo's dragon when its script ends).
+	//
+	static constexpr unsigned NODE_ACTION_CREATE_ENTITY = 0x0E3689F3;
+	static constexpr unsigned NODE_DESTROY_ENTITY = 0x5C46D801;
+	static constexpr __int64 ACTION_CREATE_SCRIPTS[] = {
+		0x580000000000622, //Mei's Ice Wall pillars
+	};
+
+	static void action_create_entity(StatescriptInstance* inst, STUStatescriptBase* node) {
+		static std::set<std::pair<__int64, int>> s_logged{};
+		if (std::find(std::begin(ACTION_CREATE_SCRIPTS), std::end(ACTION_CREATE_SCRIPTS), inst->script_id) == std::end(ACTION_CREATE_SCRIPTS)) {
+			if (s_logged.insert({ inst->script_id, node->idx_in_nodes }).second)
+				LOG_CORE(Info, "[NODES] script {:X} node {}: CreateEntity not emulated for this script\n", inst->script_id, node->idx_in_nodes);
+			return;
+		}
+		create_entity(inst, node);
+	}
+
+	static void destroy_entity(StatescriptInstance* inst, STUStatescriptBase* node) {
+		StatescriptPrimitive value{};
+		if (!eval(inst, node->graph_node.base.to_editable(), "m_entity", value) || value.type != StatescriptPrimitive_ENTITY)
+			return;
+		auto id = (uint32_t)value.value;
+		auto ent = GameEntityAdmin()->getEntById(id);
+		if (!ent || !s_created.erase(id))
+			return;
+		LOG_CORE(Info, "[NODES] destroyed entity {} for script {:X} node {}\n", id, inst->script_id, node->idx_in_nodes);
+		GameEntityAdmin()->delEnt(ent);
+	}
+
+	//
+	// STUStatescriptActionPlayScript (F9EF59A6): the client's implementation (0xD79C90) plays the script only when the
+	// target is the local player and sends every other target to the server. Hanzo's dragons are drawn by the script
+	// it plays on the dragon entity (0x132), Mei's pillars and the RIP-Tire get theirs the same way. For entities
+	// created here: load the script on the target, write the caller's m_params (param id C76B6366, m_value) into the
+	// variables the script's STUStatescriptEntryPlayScript node names for them (m_params: param id, m_out_Var), its
+	// m_out_Sender, and run that entry. A tick later, outside the caller's execution.
+	//
+	static constexpr unsigned NODE_PLAY_SCRIPT = 0xF9EF59A6;
+	static constexpr unsigned NODE_ENTRY_PLAY_SCRIPT = 0x46C48944;
+	static constexpr unsigned FIELD_PARAM_ID = 0xC76B6366;
+
+	struct PendingPlay {
+		uint32_t target;
+		__int64 script;
+		uint32_t sender;
+		std::vector<std::pair<__int64, StatescriptPrimitive>> params;
+		int tries = 0;
+	};
+	static constexpr int PLAY_TRIES = 60; //Ticks to wait for the loaded script's graph (built lazily)
+	static std::vector<PendingPlay> s_pending_plays{};
+
+	static bool has_field(STU_Object object, unsigned field) {
+		if (!object.valid())
+			return false;
+		for (auto [info, arg] : object.struct_info->RangeArgs())
+			if (arg->Hash == field)
+				return true;
+		return false;
+	}
+
+	//The resource id in a param's id field (C76B6366), 0 without one.
+	static __int64 param_id(STU_Object item) {
+		for (auto [info, arg] : item.struct_info->RangeArgs())
+			if (arg->Hash == FIELD_PARAM_ID) {
+				auto ref = item.get_argument_resource(arg);
+				return ref ? ref->resource_id : 0;
+			}
+		return 0;
+	}
+
+	static __int64 resource_field(STU_Object object, const char* field) {
+		object = object.get_runtime_root();
+		if (!object.valid())
+			return 0;
+		auto hash = stringHash(field);
+		for (auto [info, arg] : object.struct_info->RangeArgs())
+			if (arg->Hash == hash) {
+				auto ref = object.get_argument_resource(arg);
+				return ref ? ref->resource_id : 0;
+			}
+		return 0;
+	}
+
+	static void play_script(StatescriptInstance* inst, STUStatescriptBase* stu) {
+		auto node = stu->graph_node.base.to_editable();
+		StatescriptPrimitive target{};
+		if (!eval(inst, node, "m_targets", target) || target.type != StatescriptPrimitive_ENTITY || !s_created.count((uint32_t)target.value))
+			return;
+		auto script = resource_field(field_object(node, "m_script"), "m_graph");
+		if (!script)
+			return;
+		PendingPlay play{ (uint32_t)target.value, script, 0, {} };
+		if (auto self = script_entity(inst))
+			play.sender = hero_of(self) ? hero_of(self)->entity_id : self->entity_id;
+		if (has_field(node, stringHash("m_params"))) {
+			for (auto item : node.get_argument_objectlist(stringHash("m_params"))) {
+				item = item.get_runtime_root();
+				StatescriptPrimitive value{};
+				auto id = item.valid() ? param_id(item) : 0;
+				if (id && eval(inst, item, "m_value", value))
+					play.params.push_back({ id, value });
+			}
+		}
+		s_pending_plays.push_back(std::move(play));
+	}
+
+	static void run_pending_plays() {
+		auto pending = std::move(s_pending_plays);
+		s_pending_plays.clear();
+		for (auto& play : pending) {
+			auto ent = GameEntityAdmin()->getEntById(play.target);
+			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
+			if (!ss)
+				continue;
+			try_load_resource(play.script);
+			auto inst = ss->ss_inner.getByResourceId(play.script);
+			if (!inst) {
+				int before = ss->ss_inner.g1_instanceArr.num;
+				//With authority (the vfunc behind exec flag 0x8), as the server would run it
+				auto loaded = ss->vfptr->load_statescript_script_bit3(ss, play.script, 0, ent->entity_id);
+				inst = ss->ss_inner.getByResourceId(play.script);
+				if (!inst)
+					LOG_CORE(Info, "[NODES] play script {:X}: load returned {:#x}, instances {} -> {}\n", play.script, loaded, before,
+						ss->ss_inner.g1_instanceArr.num);
+			}
+			if (!inst || !inst->graph) {
+				if (++play.tries < PLAY_TRIES)
+					s_pending_plays.push_back(std::move(play));
+				else
+					LOG_CORE(Warn, "[NODES] play script {:X} on {}: not loaded\n", play.script, play.target);
+				continue;
+			}
+			run_shared_nodes(inst);
+			int entries = 0, set = 0;
+			for (int i = 0; i < inst->graph->m_nodes.count(); i++) {
+				auto entry = inst->graph->m_nodes.list()[i];
+				if (!entry || node_type(entry) != NODE_ENTRY_PLAY_SCRIPT)
+					continue;
+				auto editable = entry->graph_node.base.to_editable();
+				if (has_field(editable, stringHash("m_params"))) for (auto item : editable.get_argument_objectlist(stringHash("m_params"))) {
+					item = item.get_runtime_root();
+					auto id = item.valid() ? param_id(item) : 0;
+					for (auto& [param, value] : play.params)
+						if (param == id) {
+							set_dynamic(inst, field_object(item, "m_out_Var"), value);
+							set++;
+						}
+				}
+				if (play.sender)
+					set_dynamic(inst, field_object(editable, "m_out_Sender"), StatescriptPrimitive(play.sender, StatescriptPrimitive_ENTITY));
+				inst->ExecuteNode(i);
+				entries++;
+			}
+			LOG_CORE(Info, "[NODES] played script {:X} on {} ({} params, {} set, {} entries; instance flags {:#x}, vtable {:#x}, runs-node {:#x})\n",
+				play.script, play.target, play.params.size(), set, entries, *(uint32_t*)((char*)inst + INSTANCE_FLAGS),
+				(__int64)inst->vfptr - globals::gameBase, ((__int64*)inst->vfptr)[INSTANCE_RUNS_NODE_VFUNC] - globals::gameBase);
+		}
 	}
 
 	//An ultimate starting: a STUStatescriptStateAbility whose start button is the ultimate button follows its links
@@ -520,8 +800,15 @@ namespace server_nodes {
 				create_entity(inst, node);
 			if (node->m_isState && node_type(node) == NODE_PET && runs_node(inst, node))
 				begin_pet(inst, node, plug);
-			if (node->m_isState && node_type(node) == NODE_PLACEMENT && runs_node(inst, node) && place(inst, node, from, plug))
-				return 1;
+			if (!node->m_isState && node_type(node) == NODE_ACTION_CREATE_ENTITY && runs_node(inst, node))
+				action_create_entity(inst, node);
+			if (!node->m_isState && node_type(node) == NODE_DESTROY_ENTITY && runs_node(inst, node))
+				destroy_entity(inst, node);
+			if (!node->m_isState && node_type(node) == NODE_PLAY_SCRIPT && runs_node(inst, node))
+				play_script(inst, node);
+			if (node->m_isState && runs_node(inst, node))
+				if (auto rule = place_rule(node_type(node)); rule && place(inst, node, from, plug, *rule))
+					return 1;
 		}
 		return s_traverse_link_orig(from_impl, inst, from, a4, plug, a6);
 	}
@@ -602,6 +889,7 @@ namespace server_nodes {
 				return;
 			if (auto ent = GameEntityAdmin()->getEntById(s_possession.control)) {
 				LOG_CORE(Info, "[NODES] possession of {} ended ({})\n", s_possession.control, fired ? "fire" : "time");
+				s_created.erase(s_possession.control);
 				GameEntityAdmin()->delEnt(ent);
 			}
 			return;
@@ -665,6 +953,7 @@ namespace server_nodes {
 		if (!GameEntityAdmin())
 			return;
 		send_pending_replies();
+		run_pending_plays();
 		update_possession();
 		update_pets();
 	}
