@@ -145,6 +145,23 @@ void play_game_btn() {
 	quick_play::start_from_menu();
 }
 
+//Hero change outside the spawn room ("Change hero anywhere" in the Play menu, on by default for testing). The hero
+//select button (0xC32650 -> 0xD35160) asks 0x1074FC0(player, default, check room, &in room) whether the local
+//player may change heroes: yes when dead, otherwise only inside a spawn room volume of its team (tagged
+//0xD60000000000007 for team 1, ...006 otherwise), else it shows "You must be in a spawn room to change heroes".
+//The hero select's config vars (0xD89C10, 0xD89E40) ask it too.
+static constexpr __int64 RVA_CAN_CHANGE_HERO = 0x1074FC0;
+static char(__fastcall* s_can_change_hero_orig)(__int64, char, char, char*) = nullptr;
+
+static char __fastcall can_change_hero_hook(__int64 player, char allow_default, char check_room, char* in_room) {
+	char allowed = s_can_change_hero_orig(player, allow_default, check_room, in_room);
+	return allowed || quick_play::hero_change_anywhere();
+}
+
+//With it the new hero also takes the old one's place, not the spawn room's.
+static bool s_keep_place = false;
+static Vector4 s_kept_position{}, s_kept_rotation{};
+
 //0xd774b0
 char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, StatescriptInstance* ss, STUBase<>* stu_data) {
 	auto stu = stu_data->to_editable();
@@ -166,6 +183,16 @@ char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, Sta
 			if (hero_info->selected_heroid == hero_value.value) {
 				return 1;
 			}
+		}
+
+		auto old_ref = old_local ? old_local->getById<Component_20_ModelReference>(0x20) : nullptr;
+		auto old_hero = old_ref ? GameEntityAdmin()->getEntById(old_ref->aim_entid) : nullptr;
+		auto old_scene = old_hero ? old_hero->getById<Component_1_SceneRendering>(1) : nullptr;
+		s_keep_place = old_scene && quick_play::hero_change_anywhere();
+		if (s_keep_place) {
+			s_kept_position = old_scene->position;
+			s_kept_position.W = 0;
+			s_kept_rotation = old_scene->rotation;
 		}
 
 		PrometheusSystem::instance()->DeleteLocalEnt();
@@ -1143,6 +1170,8 @@ void PrometheusSystem::OnTick(float tick) {
 		s_applied_timed_wait_hook = true;
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER), (LPVOID)timed_wait_on_timer_hook, (PVOID*)&s_timed_wait_on_timer_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_TIMED_WAIT_ON_TIMER)));
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_CAN_CHANGE_HERO), (LPVOID)can_change_hero_hook, (PVOID*)&s_can_change_hero_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_CAN_CHANGE_HERO)));
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE), (LPVOID)create_projectile_hook, (PVOID*)&s_create_projectile_orig));
 		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + RVA_CREATE_PROJECTILE)));
 		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + RVA_VOLLEY_UPDATE), (LPVOID)volley_update_hook, (PVOID*)&s_volley_update_orig));
@@ -1618,9 +1647,15 @@ void PrometheusSystem::OnTick(float tick) {
 			cv.value = 1;
 			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, cv);*/
 			Vector4 spawn_pos{}, spawn_rot{};
+			bool kept = s_keep_place;
+			if (kept) {
+				spawn_pos = s_kept_position;
+				spawn_rot = s_kept_rotation;
+				s_keep_place = false;
+			}
 			if (globals::isDemo)
 				open_spawn_doors();
-			if (globals::isDemo && find_spawn_point(spawn_pos, spawn_rot)) {
+			if (globals::isDemo && (kept || find_spawn_point(spawn_pos, spawn_rot))) {
 				auto localplayer = controller->getById<Component_2F_LocalPlayer>(0x2F);
 				localplayer->SetRotation(spawn_rot);
 				auto comp = model->getById<__int64>(0x15);

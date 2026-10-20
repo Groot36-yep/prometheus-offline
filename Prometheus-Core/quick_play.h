@@ -19,6 +19,11 @@ namespace quick_play {
 	bool autostart();
 	void set_autostart(bool enabled);
 
+	//Hero select opens anywhere, not only in a spawn room (the game's rule), and the new hero takes the old one's
+	//place. On by default, for testing.
+	bool hero_change_anywhere();
+	void set_hero_change_anywhere(bool enabled);
+
 	//Main menu Play button: matchmaking screens first, then the map.
 	void start_from_menu();
 	//Same without the matchmaking screens (top bar).

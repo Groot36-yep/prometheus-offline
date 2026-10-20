@@ -145,6 +145,9 @@ void management_window::render() {
 					if (ImGui::MenuItem("Start a game when Overwatch launches", nullptr, quick_play::autostart())) {
 						quick_play::set_autostart(!quick_play::autostart());
 					}
+					if (ImGui::MenuItem("Change hero anywhere", nullptr, quick_play::hero_change_anywhere())) {
+						quick_play::set_hero_change_anywhere(!quick_play::hero_change_anywhere());
+					}
 					if (ImGui::MenuItem("Borderless window", nullptr, display::borderless())) {
 						display::set_borderless(!display::borderless());
 					}

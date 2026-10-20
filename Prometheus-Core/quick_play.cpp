@@ -61,6 +61,7 @@ namespace quick_play {
 		__int64 map = MAP_HANAMURA;
 		__int64 hero = 0;
 		bool autostart = false;
+		bool hero_change_anywhere = true;
 	};
 
 	static Settings& settings() {
@@ -74,6 +75,7 @@ namespace quick_play {
 				s.map = j.value("map", s.map);
 				s.hero = j.value("hero", s.hero);
 				s.autostart = j.value("autostart", s.autostart);
+				s.hero_change_anywhere = j.value("hero_change_anywhere", s.hero_change_anywhere);
 			}
 		}
 		return s;
@@ -83,7 +85,8 @@ namespace quick_play {
 		auto& s = settings();
 		std::ofstream file(SETTINGS_PATH, std::ios::out | std::ios::trunc);
 		if (file.is_open())
-			file << nlohmann::json{ { "map", s.map }, { "hero", s.hero }, { "autostart", s.autostart } }.dump(2);
+			file << nlohmann::json{ { "map", s.map }, { "hero", s.hero }, { "autostart", s.autostart },
+				{ "hero_change_anywhere", s.hero_change_anywhere } }.dump(2);
 	}
 
 	static void set_step(Step step) {
@@ -211,6 +214,15 @@ namespace quick_play {
 
 	void set_autostart(bool enabled) {
 		settings().autostart = enabled;
+		save_settings();
+	}
+
+	bool hero_change_anywhere() {
+		return settings().hero_change_anywhere;
+	}
+
+	void set_hero_change_anywhere(bool enabled) {
+		settings().hero_change_anywhere = enabled;
 		save_settings();
 	}
 
