@@ -623,7 +623,27 @@ namespace auto_test {
 			start_press();
 	}
 
+	//"pitch=<degrees>" tilts the view before the presses, e.g. at the floor to see whether projectiles hit it; "yaw=<degrees>"
+	//turns it about the vertical axis (both absolute, as a quaternion like Component_2F_LocalPlayer::SetRotation takes).
+	//"sweep=<n>" turns it 360/n further before each fire probe: "sequence=x+x+x+x+x+x+x,sweep=8" fires in 8 directions (an
+	//unknown button name presses nothing).
+	static void aim(size_t probe) {
+		auto pitch_pos = s_options.find("pitch="), yaw_pos = s_options.find("yaw="), sweep_pos = s_options.find("sweep=");
+		if (pitch_pos == std::string::npos && yaw_pos == std::string::npos && sweep_pos == std::string::npos)
+			return;
+		float pitch = pitch_pos != std::string::npos ? std::stof(s_options.substr(pitch_pos + 6)) : 0;
+		float yaw = yaw_pos != std::string::npos ? std::stof(s_options.substr(yaw_pos + 4)) : 0;
+		if (sweep_pos != std::string::npos)
+			yaw += probe * 360.f / std::max(1.f, std::stof(s_options.substr(sweep_pos + 6)));
+		float p = pitch * 3.14159265f / 360.f, y = yaw * 3.14159265f / 360.f; //Half angles
+		if (auto local = GameEntityAdmin()->getLocalEnt()->getById<Component_2F_LocalPlayer>(0x2F))
+			local->SetRotation(Vector4(std::cos(y) * std::sin(p), std::sin(y) * std::cos(p), -std::sin(y) * std::sin(p), std::cos(y) * std::cos(p)));
+		LOG_CORE(Info, "[AUTOTEST] aiming: yaw {:.0f}, pitch {:.0f}\n", yaw, pitch);
+	}
+
 	static void start_press() {
+		if (actions()[s_action].probe && s_action > 0 && s_options.find("sweep=") != std::string::npos)
+			aim(s_action / 2);
 		s_entities_before.clear();
 		s_new_entities.clear();
 		for (auto ent : *GameEntityAdmin())
@@ -921,13 +941,7 @@ namespace auto_test {
 					break;
 				}
 				s_hero_report["spawned"] = true;
-				//"pitch=<degrees>" tilts the view before the presses, e.g. at the floor to see whether projectiles hit it
-				//(rotation about the X axis, as a quaternion like Component_2F_LocalPlayer::SetRotation takes).
-				if (auto pos = s_options.find("pitch="); pos != std::string::npos) {
-					float radians = std::stof(s_options.substr(pos + 6)) * 3.14159265f / 180.f;
-					if (auto local = GameEntityAdmin()->getLocalEnt()->getById<Component_2F_LocalPlayer>(0x2F))
-						local->SetRotation(Vector4(std::sin(radians / 2), 0, 0, std::cos(radians / 2)));
-				}
+				aim(0);
 				//The game opens hero select by itself. It does not block the button events sent to the hero's scripts,
 				//so only record it (pressing hero_select does not close it).
 				s_hero_report["hero_select_open"] = hero_select_active();

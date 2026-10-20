@@ -429,7 +429,55 @@ namespace server_nodes {
 	};
 	static std::vector<PendingMessage> s_pending_messages{};
 
+	//Debug (env PROMETHEUS_TRACK_PROJECTILES): logs every projectile's position each tick and where it was last seen.
+	struct Tracked {
+		double born;
+		Vector3 last;
+	};
+	static std::map<uint32_t, Tracked> s_tracked{};
+	static bool tracking() {
+		static bool s_on = getenv("PROMETHEUS_TRACK_PROJECTILES") != nullptr;
+		return s_on;
+	}
+
+	static void track_projectile(Entity* projectile) {
+		auto scene = projectile->getById<Component_1_SceneRendering>(1);
+		Vector3 pos = scene ? Vector3(scene->position.X, scene->position.Y, scene->position.Z) : Vector3();
+		auto res = !IsBadReadPtr(projectile->resload_entry, 8) ? projectile->resload_entry->resource_id : 0;
+		auto hero = hero_of(GameEntityAdmin()->getLocalEnt());
+		auto hero_scene = hero ? hero->getById<Component_1_SceneRendering>(1) : nullptr;
+		std::string components;
+		for (int i = 0; i < projectile->component_list.num - 1; i++)
+			if (auto compo = projectile->component_list.ptr[i])
+				components += std::format(" {:X}", compo->component_id);
+		LOG_CORE(Info, "[TRACK] {} created: {:X} at ({:.2f}, {:.2f}, {:.2f}), hero at ({:.2f}, {:.2f}, {:.2f}), components{}\n", projectile->entity_id, res,
+			pos.X, pos.Y, pos.Z, hero_scene ? hero_scene->position.X : 0, hero_scene ? hero_scene->position.Y : 0, hero_scene ? hero_scene->position.Z : 0, components);
+		s_tracked[projectile->entity_id] = { GetGameRuntimeSecs(), pos };
+	}
+
+	static void track_projectiles() {
+		auto now = GetGameRuntimeSecs();
+		for (auto it = s_tracked.begin(); it != s_tracked.end();) {
+			auto& [id, tracked] = *it;
+			auto ent = GameEntityAdmin()->getEntById(id);
+			if (!ent) {
+				LOG_CORE(Info, "[TRACK] {} gone after {:.2f} s, last at ({:.2f}, {:.2f}, {:.2f})\n", id, now - tracked.born, tracked.last.X, tracked.last.Y, tracked.last.Z);
+				it = s_tracked.erase(it);
+				continue;
+			}
+			if (auto scene = ent->getById<Component_1_SceneRendering>(1))
+				tracked.last = Vector3(scene->position.X, scene->position.Y, scene->position.Z);
+			LOG_CORE(Info, "[TRACK] {} {:.3f} ({:.2f}, {:.2f}, {:.2f})\n", id, now - tracked.born, tracked.last.X, tracked.last.Y, tracked.last.Z);
+			if (now - tracked.born > 5)
+				it = s_tracked.erase(it);
+			else
+				++it;
+		}
+	}
+
 	void projectile_created(Entity* projectile) {
+		if (projectile && tracking())
+			track_projectile(projectile);
 		auto ss = projectile ? projectile->getById<Component_23_Statescript>(0x23) : nullptr;
 		if (!ss)
 			return;
@@ -666,12 +714,17 @@ namespace server_nodes {
 	static constexpr unsigned FIELD_PLACED_NORMAL = 0x57216848;
 	static constexpr unsigned FIELD_PLACED_FORWARD = 0x2650F0BE;
 
-	static void set_dynamic(StatescriptInstance* inst, STU_Object var, StatescriptPrimitive value) {
-		if (!var.valid() || !inst->rid_instance_varbag)
+	static void set_dynamic(StatescriptInstance* inst, STUConfigVarDynamic* var, StatescriptPrimitive value) {
+		if (!var || !inst->rid_instance_varbag)
 			return;
 		STUConfigVar_Custom cv(value);
 		auto bag = inst->rid_instance_varbag;
-		bag->base.stu_base.vfptr->SetConfigVarValueFromSTUConfigVar(bag, (STUConfigVarDynamic*)var.value, cv.get(), 0);
+		bag->base.stu_base.vfptr->SetConfigVarValueFromSTUConfigVar(bag, var, cv.get(), 0);
+	}
+
+	static void set_dynamic(StatescriptInstance* inst, STU_Object var, StatescriptPrimitive value) {
+		if (var.valid())
+			set_dynamic(inst, (STUConfigVarDynamic*)var.value, value);
 	}
 
 	static StatescriptPrimitive vec3(const void* xyz) {
@@ -697,13 +750,21 @@ namespace server_nodes {
 		int valid;           //Byte in the state that says the spot is valid (-1: always placed)
 		__int64 update;      //Recomputes the spot first (0: none)
 		bool write_placed;   //Write the placed position/normal/forward vars
+		int outputs_at = 0;  //Data outputs: the node's config vars from this offset on, floats from state +0xa8 on
+		int outputs = 0;
 	};
+	//Mei's wall states publish what they measure as data outputs (bound to their vars only while the state runs:
+	//registered on start, vtable slot 44, read through 0xD6E030 / 0xD6E340): 12AA4F0F the wall's length (var 0x48C)
+	//and more, each 614C3A0A one pillar's height (0x18B0-0x18B4) and the tallest (0x48D). Placed by the chain below,
+	//the states end before the nodes that read them (the pillar conditions, each pillar's rise time), which then
+	//read 0: only the first pillar was created, and it never rose out of the floor. Written to the vars instead.
 	static constexpr PlaceRule PLACE_RULES[] = {
 		{ NODE_PLACEMENT, 0xC63FD388, 0x02701BF5, 0xD3894419, PLACEMENT_VALID, RVA_PLACEMENT_UPDATE, true },
 		{ 0x72509D3B, 0xC63FD388, 0x02701BF5, 0, 0xc8, 0, false }, //STUStatescriptStateFindGround: +0xc8 ground found
-		{ 0x12AA4F0F, 0x5556C513, 0x8CF01B33, 0, -1, 0, false },
-		{ 0x614C3A0A, 0x5556C513, 0x8CF01B33, 0, -1, 0, false },
+		{ 0x12AA4F0F, 0x5556C513, 0x8CF01B33, 0, -1, 0, false, 0x148, 4 },
+		{ 0x614C3A0A, 0x5556C513, 0x8CF01B33, 0, -1, 0, false, 0x140, 2 },
 	};
+	static constexpr int STATE_DATA_OUTPUTS = 0xa8;
 
 	static const PlaceRule* place_rule(unsigned type) {
 		for (auto& rule : PLACE_RULES)
@@ -740,10 +801,19 @@ namespace server_nodes {
 		bool valid = rule.valid < 0 || *((char*)state + rule.valid) != 0;
 		if (valid && rule.write_placed)
 			write_placed(inst, editable, state);
+		for (int i = 0; valid && i < rule.outputs; i++) {
+			auto var = *(STUBase<>**)((char*)node + rule.outputs_at + 8 * i);
+			if (!var || var->vfptr->GetSTUInfo()->Hash != stringHash("STUConfigVarDynamic"))
+				continue;
+			StatescriptPrimitive value(0, StatescriptPrimitive_FLT);
+			memcpy(&value.value, (char*)state + STATE_DATA_OUTPUTS + 4 * i, sizeof(float));
+			set_dynamic(inst, (STUConfigVarDynamic*)var, value);
+		}
 		unsigned out_field = valid ? rule.placed : rule.not_placed;
 		auto out = out_field ? field_object(editable, out_field) : STU_Object();
-		LOG_CORE(Info, "[NODES] place: script {:X} node {} type {:08X} (from node {}): {}\n", inst->script_id, node->idx_in_nodes,
-			rule.type, from ? from->idx_in_nodes : -1, valid ? "placed" : "no valid spot");
+		LOG_CORE(Info, "[NODES] place: script {:X} node {} type {:08X} (from node {}): {} (state +a8 {} +ac {} +b0 {} +b4 {}, vtable {:#x})\n", inst->script_id, node->idx_in_nodes,
+			rule.type, from ? from->idx_in_nodes : -1, valid ? "placed" : "no valid spot", *(float*)((char*)state + 0xa8), *(float*)((char*)state + 0xac),
+			*(float*)((char*)state + 0xb0), *(float*)((char*)state + 0xb4), *(__int64*)state - globals::gameBase);
 		if (out.valid())
 			((char(__fastcall*)(StatescriptState*, StatescriptInstance*, STUStatescriptBase*, __int64, int))(globals::gameBase + RVA_TRAVERSE_PLUG))(
 				state, inst, node, (__int64)out.value, 0x80);
@@ -1347,7 +1417,10 @@ namespace server_nodes {
 		auto hero = hero_of(GameEntityAdmin()->getLocalEnt());
 		if (auto ss = hero ? hero->getById<Component_23_Statescript>(0x23) : nullptr)
 			LOG_CORE(Info, "[VARS] hero {}: cf {} counters {} {}\n", hero->entity_id, ss->ss_inner.cf_timestamp, ss->ss_inner.increasing_counter1, ss->ss_inner.increasing_counter3);
-		for (auto id : s_created) {
+		auto ids = std::vector<uint32_t>(s_created.begin(), s_created.end());
+		if (hero)
+			ids.push_back(hero->entity_id); //Also the hero's own scripts
+		for (auto id : ids) {
 			auto ent = GameEntityAdmin()->getEntById(id);
 			auto ss = ent ? ent->getById<Component_23_Statescript>(0x23) : nullptr;
 			auto inst = ss ? ss->ss_inner.getByResourceId(s_script) : nullptr;
@@ -1394,6 +1467,8 @@ namespace server_nodes {
 			return;
 		remove_orphans();
 		watch_vars();
+		if (tracking())
+			track_projectiles();
 		run_clocks();
 		land_projectiles();
 		send_pending_messages();

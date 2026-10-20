@@ -218,8 +218,7 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   `display.cpp` sets WindowedFullscreen = 1 the same way: exclusive fullscreen goes from yes to no and the window
   stays 2560×1440 without borders. The game state tick (`0xBFF460`) can force FullscreenWindow back to 1 under
   some flags, so display.cpp keeps checking.
-- The user's `Documents\Overwatch\Settings\Settings_v0.ini` belongs to the live game (last written April 2026, before
-  any beta run) and must not be edited.
+- `Documents\Overwatch\Settings\Settings_v0.ini` belongs to the live game, not the beta, and must not be edited.
 - Found with Ghidra headless (`C:\tools\re\ghidra_headless.ps1`, scripts StringRefs/RefsTo on project `OW08`) and
   new Auto Test dumps: `PROMETHEUS_DUMP_INI` (ini settings) and the map dump's script ids.
 - **TODO when game modes are emulated:** removing every door at spawn skips the setup phase (attackers could leave
@@ -301,6 +300,11 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   impact is the projectile component's job, not a script. The spawner path (type 1) also sets filter bit
   `0x800000` on component `0x10` (`0xCD0B00`), but these projectiles have no component `0x10`.
 - `0xD45240` clears projectile component `+0xE2A` after every creation (it is not the "predicted" difference).
+- 2026-10-19: env `PROMETHEUS_TRACK_PROJECTILES` logs every projectile's position each tick and where it was last
+  seen; Auto Test `yaw=<deg>` and `sweep=<n>` (with `sequence=x+x+...`) aim and fire in several directions. In the
+  London (`0xD4`) and Numbani spawn rooms Pharah's rockets, Barrage, Zarya's grenade and Graviton all stopped at the
+  walls and ceiling they hit (rockets 10-21 m) and exploded there; Graviton stuck to the ceiling for 1.5 s with only
+  a small sphere (no vortex). Where projectiles pass through walls is still not reproduced.
 
 ## Server-only statescript nodes: deployables (2026-10-18)
 
@@ -459,3 +463,18 @@ map, then per hero: spawns it like hero select does, presses fire, then each of 
   waits for server messages `0x8F`/`0x90` and others; the turret also keeps its burning look. Mei's drone model is
   not seen in the storm. Projectiles through floors (Junkrat's grenades end up far away; not settled). Zarya's
   Graviton vortex.
+- Hero change outside the spawn room (2026-10-19): the hero select button (logical button 171, checked in
+  `0xC32650`) calls `0xD35160`, which asks `0x1074FC0(player, default, check room, &in room)`: allowed when dead,
+  otherwise only inside a spawn room volume of the player's team (volumes tagged `0xD60000000000007` for team 1,
+  `...006` otherwise); if not, it shows "You must be in a spawn room to change heroes" (string `0xDE000000000043F`).
+  `0xD89C10`/`0xD89E40` (hero select config vars) ask it too. Since the player is on team 0, no spawn room matches.
+  Play menu > "Change hero anywhere" (on by default, `play_settings.json`) makes it answer yes, and the new hero
+  takes the old one's place instead of the spawn point. Not tested in game yet.
+- Mei's Ice Wall (2026-10-19): only 1 of the 5 pillars was created, and none rose. The wall states publish their
+  measurements as data outputs, bound to vars only while the state runs (registered on start, vtable slot 44;
+  getters `0xD6E030` / `0xD6E340`, computed by `0x1099FA0` / `0x109A580` with 5 ray casts): 12AA4F0F the wall length
+  (var `0x48C`, 3.75), each 614C3A0A one pillar's height (`0x18B0`-`0x18B4`, 4.4) and the tallest (`0x48D`). The
+  "place now" chain ends these states before the pillar conditions (nodes 66-69) and PlayScript params (rise end
+  time, var `0x1894` in the pillar script `0x636`) read them, so they read 0. The place emulation now writes the
+  outputs (state `+0xa8`.., config vars at node `+0x140` / `+0x148`) into the vars: all 5 pillars are created and
+  played. They are still not visible (open).
